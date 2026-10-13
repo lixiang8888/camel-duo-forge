@@ -1,0 +1,223 @@
+"""命令行：三个子命令跑得通，参数给错时报的是人话。
+
+全程 --mock，不联网、不需要 API key。
+"""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from duo_forge import blueprint as blueprint_mod
+from duo_forge.cli import main
+
+PURPOSE = "给刚上班、每天坐十小时的程序员写一份颈椎保养手册，要能真的照做。"
+
+
+def _forge(tmp_path, *extra: str):
+    return main(["forge", "--purpose", PURPOSE, "--mock", "--out", str(tmp_path), *extra])
+
+
+# ---------------------------------------------------------------------------
+# forge：功能一 + 功能二
+# ---------------------------------------------------------------------------
+
+
+def test_forge_writes_a_blueprint_json_and_a_readable_copy(tmp_path, capsys):
+    assert _forge(tmp_path) == 0
+
+    files = sorted(p.name for p in tmp_path.iterdir())
+    assert len(files) == 2
+    assert files[0].endswith(".json") and files[1].endswith(".md")
+
+    made = blueprint_mod.load(tmp_path / files[0])
+    assert made.origin == "mock"
+    assert len(made.personas) == 2
+    assert len(made.topics) >= 2
+
+
+def test_forge_reports_the_result_and_the_next_step(tmp_path, capsys):
+    _forge(tmp_path)
+    out = capsys.readouterr().out
+
+    assert "两位专家：" in out
+    assert "议题（" in out
+    for key in ("mock-baseline", "mock-reality"):
+        assert key in out
+    # 明确告诉人下一步该敲什么，别让人去翻 README
+    assert "duo-forge run --blueprint" in out
+    assert str(tmp_path) in out
+
+
+def test_forge_says_out_loud_that_mock_is_worthless(tmp_path, capsys):
+    _forge(tmp_path)
+    assert "模拟模式" in capsys.readouterr().out
+
+
+def test_forge_warns_on_the_readable_copy(tmp_path):
+    _forge(tmp_path)
+    markdown = next(tmp_path.glob("*.md")).read_text(encoding="utf-8")
+    assert "mock" in markdown  # 来源标注
+    assert "【发言纪律】" in markdown  # 完整的提示词都摊开了
+
+
+def test_forge_honours_an_explicit_title(tmp_path):
+    _forge(tmp_path, "--title", "我的颈椎手册")
+    made = blueprint_mod.load(next(tmp_path.glob("*.json")))
+    assert made.title == "我的颈椎手册"
+
+
+def test_forge_accepts_a_purpose_file(tmp_path):
+    path = tmp_path / "purpose.md"
+    path.write_text(
+        "# 颈椎手册\n\n给刚上班、每天坐十小时的程序员写一份保养手册。", encoding="utf-8"
+    )
+    assert (
+        main(
+            [
+                "forge", "--purpose-file", str(path), "--mock",
+                "--out", str(tmp_path),
+            ]
+        )
+        == 0
+    )
+    assert blueprint_mod.load(next(tmp_path.glob("*.json"))).title == "颈椎手册"
+
+
+# ---------------------------------------------------------------------------
+# 参数给错时
+# ---------------------------------------------------------------------------
+
+
+def test_purpose_and_purpose_file_are_exclusive(tmp_path, capsys):
+    path = tmp_path / "p.md"
+    path.write_text(PURPOSE, encoding="utf-8")
+    code = main(
+        ["forge", "--purpose", PURPOSE, "--purpose-file", str(path), "--mock"]
+    )
+    assert code == 2
+    assert "只能给一个" in capsys.readouterr().err
+
+
+def test_no_purpose_at_all(tmp_path, capsys):
+    assert main(["forge", "--mock", "--out", str(tmp_path)]) == 2
+    assert "没有写目的" in capsys.readouterr().err
+
+
+def test_a_too_short_purpose_is_refused(tmp_path, capsys):
+    assert main(["forge", "--purpose", "写点", "--mock", "--out", str(tmp_path)]) == 2
+    assert "太短" in capsys.readouterr().err
+
+
+def test_a_missing_purpose_file(tmp_path, capsys):
+    code = main(["forge", "--purpose-file", str(tmp_path / "nope.txt"), "--mock"])
+    assert code == 2
+    assert "读不出" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# run
+# ---------------------------------------------------------------------------
+
+
+def test_run_from_a_blueprint(tmp_path, capsys):
+    _forge(tmp_path)
+    bp_path = next(tmp_path.glob("*.json"))
+    out = tmp_path / "out"
+
+    assert (
+        main(["run", "--blueprint", str(bp_path), "--mock", "--rounds", "2",
+              "--out", str(out)])
+        == 0
+    )
+
+    produced = sorted(p.name for p in out.iterdir())
+    assert len(produced) == 3
+    assert any(name.startswith("handbook-") for name in produced)
+    assert any(name.startswith("transcript-") for name in produced)
+    assert any(name.startswith("quick-") for name in produced)
+    assert "成果文件：" in capsys.readouterr().out
+
+
+def test_run_without_anything_is_refused(capsys):
+    assert main(["run", "--mock"]) == 2
+    assert "没有写目的" in capsys.readouterr().err
+
+
+def test_run_with_both_a_blueprint_and_a_purpose_is_refused(tmp_path, capsys):
+    _forge(tmp_path)
+    bp_path = next(tmp_path.glob("*.json"))
+    code = main(
+        ["run", "--blueprint", str(bp_path), "--purpose", PURPOSE, "--mock"]
+    )
+    assert code == 2
+    assert "只能给一个" in capsys.readouterr().err
+
+
+def test_run_with_an_unknown_topic_key(tmp_path, capsys):
+    _forge(tmp_path)
+    bp_path = next(tmp_path.glob("*.json"))
+    code = main(
+        ["run", "--blueprint", str(bp_path), "--only", "nope", "--mock",
+         "--out", str(tmp_path / "out")]
+    )
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "nope" in err
+    assert "mock-baseline" in err  # 把可选的列出来
+
+
+def test_run_from_a_purpose_saves_the_blueprint_it_used(tmp_path, capsys):
+    """现生成的那份蓝图要存下来，否则想复现或想改一个议题重跑，都得再花两次调用。"""
+    out = tmp_path / "out"
+    assert (
+        main(["run", "--purpose", PURPOSE, "--mock", "--rounds", "1",
+              "--out", str(out)])
+        == 0
+    )
+    assert list(out.glob("*.json")), "蓝图没落盘"
+    assert "蓝图已存" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# show
+# ---------------------------------------------------------------------------
+
+
+def test_show_prints_the_readable_version(tmp_path, capsys):
+    _forge(tmp_path)
+    capsys.readouterr()  # 把 forge 的输出清掉，下面只看 show 自己印了什么
+    bp_path = next(tmp_path.glob("*.json"))
+
+    assert main(["show", "--blueprint", str(bp_path)]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("# 蓝图 · ")
+    assert "## 两位专家" in out
+    assert "## 议题" in out
+
+
+def test_show_json_round_trips(tmp_path, capsys):
+    """--json 打出来的必须能直接喂回 from_dict。"""
+    _forge(tmp_path)
+    capsys.readouterr()
+    bp_path = next(tmp_path.glob("*.json"))
+
+    assert main(["show", "--blueprint", str(bp_path), "--json"]) == 0
+    out = capsys.readouterr().out
+    assert json.loads(out) == json.loads(bp_path.read_text(encoding="utf-8"))
+
+
+def test_show_reports_a_broken_blueprint(tmp_path, capsys):
+    path = tmp_path / "bad.json"
+    path.write_text("{不是 JSON", encoding="utf-8")
+    assert main(["show", "--blueprint", str(path)]) == 2
+    assert "不是合法 JSON" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+
+
+def test_no_subcommand_prints_help(capsys):
+    assert main([]) == 1
+    assert "forge" in capsys.readouterr().out
