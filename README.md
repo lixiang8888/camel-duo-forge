@@ -7,7 +7,7 @@ uv run duo-forge forge --purpose "给刚上班、每天坐十小时的程序员�
 uv run duo-forge run   --blueprint blueprints/neck-care-20261013-101500.json
 ```
 
-它和 [camel-fitness-nutrition-duo](../camel-fitness-nutrition-duo) 是同一套骨架：那边的人格和议题是**手写死的**（营养师 × 教练、五个健身议题），这边把它们换成**按目的生成**。骨架、编排、整理环节、离线模拟都是搬过来的。
+它和另一个项目 camel-fitness-nutrition-duo（不在本仓库里）是同一套骨架：那边的人格和议题是**手写死的**（营养师 × 教练、五个健身议题），这边把它们换成**按目的生成**。骨架、编排、整理环节、离线模拟都是搬过来的。
 
 ---
 
