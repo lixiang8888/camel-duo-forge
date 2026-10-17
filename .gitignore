@@ -10,4 +10,15 @@ __pycache__/
 # 运行产物：每次跑都会重新生成
 outputs/*.md
 outputs/*.json
+outputs/*.log
 !outputs/.gitkeep
+
+# 蓝图：网页 forge 和命令行 forge 都会生成，属于运行产物。
+# 目录本身保留（.gitkeep），生成出来的文件不提交。
+blueprints/*.json
+blueprints/*.md
+!blueprints/.gitkeep
+
+# Windows 快捷方式 —— make_shortcut.py 本该把它建在桌面上，掉在项目根目录的是误产物。
+# 而且它内嵌本机发行版名和绝对路径，换台机器就失效，仓库又是公开的，绝不提交。
+*.lnk

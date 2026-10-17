@@ -27,3 +27,6 @@ packages = ["src/duo_forge"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# 根目录的 launcher.py 不在 src/ 包里（也不该进 wheel），测试要 import 它，
+# 所以把仓库根加进 pytest 的 sys.path。只影响 pytest，不影响运行时。
+pythonpath = ["."]
