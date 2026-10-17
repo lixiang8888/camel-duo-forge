@@ -5,12 +5,14 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 
 import pytest
 
 from duo_forge import blueprint as blueprint_mod
 from duo_forge.blueprint import BlueprintError, from_dict, load
+from duo_forge.personas import Persona
 from duo_forge.topics import CLOSING_KEY
 
 
@@ -145,6 +147,17 @@ def test_select_always_puts_closing_last(blueprint):
     assert [t.key for t in topics] == ["reality", CLOSING_KEY]
 
 
+def test_select_closing_counts_only_the_selected_topics(blueprint):
+    """收尾议题的「我们前面谈了 N 个」必须是本次选中的数量，不是蓝图里的总数。
+
+    只跑一个议题却说谈了全部，是在骗读者，也会让整理环节去回顾没跑过的内容。
+    """
+    assert len(blueprint.topics) == 2
+    closing = blueprint.select("reality")[-1]
+    assert "前面 1 个议题" in closing.brief
+    assert "我们前面谈了 1 个议题" in closing.opening
+
+
 def test_select_rejects_an_unknown_key_and_lists_the_valid_ones(blueprint):
     with pytest.raises(BlueprintError) as excinfo:
         blueprint.select("baselin")
@@ -155,3 +168,48 @@ def test_select_rejects_an_unknown_key_and_lists_the_valid_ones(blueprint):
 
 def test_closing_brief_counts_the_topics(blueprint):
     assert str(len(blueprint.topics)) in blueprint.closing().brief
+
+
+# ---------------------------------------------------------------------------
+# 用户手写的人格（含长背景与案例）
+# ---------------------------------------------------------------------------
+
+
+def test_a_manual_persona_round_trips(blueprint):
+    manual = Persona(
+        "许医师",
+        "三甲医院康复科物理治疗师",
+        "什么是对的",
+        "【人格】\n只认证据。\n\n【专业立场】\n先评估。\n\n"
+        "【你的盲区，不要掩饰】\n偏理想。\n\n【长期背景与案例】\n病例。",
+    )
+    edited = dataclasses.replace(blueprint, personas=(manual, blueprint.challenger))
+    back = from_dict(json.loads(edited.to_json()))
+    assert back.personas[0] == manual
+
+
+def test_a_long_manual_message_loads(blueprint, tmp_path):
+    """加载器保持宽松：蓝图是给人手改的，12000 字的上限只在创建时管。"""
+    long_message = "【人格】\n" + "病例经过。\n" * 1500
+    manual = Persona("甲", "身份", "立场", long_message)
+    edited = dataclasses.replace(blueprint, personas=(manual, blueprint.challenger))
+    path = edited.save(tmp_path)
+    assert load(path).personas[0].system_message == long_message.strip()
+
+
+def test_markdown_fence_survives_a_code_fence_in_the_persona(blueprint):
+    tricky = Persona(
+        "甲", "身份", "立场", "【人格】\n```python\nprint(1)\n```\n【专业立场】\n内容"
+    )
+    edited = dataclasses.replace(blueprint, personas=(tricky, blueprint.challenger))
+    text = edited.to_markdown()
+    # 正文里有三个反引号，围栏必须更长，否则会被提前闭合
+    assert "````text" in text
+
+
+def test_save_does_not_overwrite_a_same_second_blueprint(blueprint, tmp_path):
+    first = blueprint.save(tmp_path, stamp="20260101-000000")
+    second = blueprint.save(tmp_path, stamp="20260101-000000")
+    assert first != second
+    assert second.exists()
+    assert load(second) == blueprint

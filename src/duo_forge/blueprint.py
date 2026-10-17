@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -73,7 +74,10 @@ class Blueprint:
                 f"蓝图《{self.title}》里没有这几个议题：{', '.join(unknown)}。\n"
                 f"  可选：{valid}"
             )
-        return [by_key[k.strip()] for k in only.split(",") if k.strip()] + [self.closing()]
+        selected = [by_key[k.strip()] for k in only.split(",") if k.strip()]
+        # 收尾议题的开场白要说「我们前面谈了 N 个议题」，这个 N 必须是**本次选中**的
+        # 数量，不是蓝图里的总数——`--only` 只跑一个议题时，说成全部会说谎。
+        return selected + [closing_topic(len(selected), self.title)]
 
     # ---- 序列化 ----------------------------------------------------------
 
@@ -133,12 +137,15 @@ class Blueprint:
             "",
         ]
         for persona, challenger in ((self.proposer, False), (self.challenger, True)):
+            message = full_system_message(persona, challenger=challenger)
+            # 用户手写的人格可能自带代码围栏；固定三反引号会被它提前闭合。
+            fence = _fence_for(message)
             lines += [
                 f"### {persona.name} · {persona.title}",
                 "",
-                "```text",
-                full_system_message(persona, challenger=challenger),
-                "```",
+                f"{fence}text",
+                message,
+                fence,
                 "",
             ]
 
@@ -165,8 +172,24 @@ class Blueprint:
         out_dir.mkdir(parents=True, exist_ok=True)
         stamp = stamp or datetime.now().strftime("%Y%m%d-%H%M%S")
         path = out_dir / f"{self.slug}-{stamp}.json"
+        # 两位人格都手写时 forge 只跑一次议题调用，连续两次很可能落在同一秒。
+        # 不覆盖别人刚写出来的蓝图。
+        if path.exists():
+            suffix = 2
+            while True:
+                candidate = out_dir / f"{self.slug}-{stamp}-{suffix}.json"
+                if not candidate.exists():
+                    path = candidate
+                    break
+                suffix += 1
         path.write_text(self.to_json(), encoding="utf-8")
         return path
+
+
+def _fence_for(text: str) -> str:
+    """生成一段比正文里最长反引号串更长（至少三个）的围栏。"""
+    longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
+    return "`" * max(3, longest + 1)
 
 
 def load(path: Path | str) -> Blueprint:
