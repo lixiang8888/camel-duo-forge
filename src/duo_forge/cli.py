@@ -19,12 +19,14 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import json
 import sys
 from pathlib import Path
 
 from . import blueprint as blueprint_mod
 from .blueprint import Blueprint, BlueprintError
 from .config import BLUEPRINT_DIR, MissingApiKey, build_author_backend, build_backend
+from .personas import PersonaPlan, PersonaSpecError, parse_persona_plan
 from .purpose import InvalidPurpose, Purpose, make_purpose, read_purpose_file
 from .topics import DEFAULT_TOPIC_COUNT
 
@@ -57,6 +59,29 @@ def _purpose_from_args(args: argparse.Namespace) -> Purpose:
     return make_purpose(args.purpose, args.title)
 
 
+def _add_persona_args(parser: argparse.ArgumentParser) -> None:
+    group = parser.add_argument_group("自定义人格（可选）")
+    group.add_argument(
+        "--personas-file", type=Path, default=None,
+        help="JSON 文件：可自定义一位或两位专家（mode=auto/hint/manual）。格式见 README",
+    )
+
+
+def _load_persona_plan(path: Path | None) -> PersonaPlan:
+    """读人格文件并校验。所有失败都包成 PersonaSpecError，消息能直接给人看。"""
+    if path is None:
+        return PersonaPlan()
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise PersonaSpecError(f"读不出人格文件 {path}：{exc}") from None
+    except json.JSONDecodeError as exc:
+        raise PersonaSpecError(
+            f"人格文件不是合法 JSON：{exc.msg}（第 {exc.lineno} 行）"
+        ) from None
+    return parse_persona_plan(raw)
+
+
 # ---------------------------------------------------------------------------
 # forge
 # ---------------------------------------------------------------------------
@@ -71,16 +96,39 @@ def _cmd_forge(args: argparse.Namespace) -> int:
         print(f"\n[目的有问题] {exc}\n", file=sys.stderr)
         return 2
 
+    # 人格文件在任何付费调用之前解析完：写错一个字不该先花掉一次模型调用。
+    try:
+        plan = _load_persona_plan(args.personas_file)
+    except PersonaSpecError as exc:
+        print(f"\n[人格设定有问题] {exc}\n", file=sys.stderr)
+        return 2
+
     print(f"目的：{purpose.summary()}")
-    print(f"要生成：两位专家的人格 + 约 {args.topics} 个议题（2 次模型调用）\n")
+    if plan.both_manual:
+        print(f"要生成：约 {args.topics} 个议题（两位专家由你提供，1 次模型调用）\n")
+    elif plan.has_manual:
+        print(f"要生成：另一位专家的人格 + 约 {args.topics} 个议题（2 次模型调用）\n")
+    else:
+        print(f"要生成：两位专家的人格 + 约 {args.topics} 个议题（2 次模型调用）\n")
 
     if args.mock:
-        print("!! 模拟模式：生成的是占位内容，两位专家和议题都没有参考价值。\n")
+        if plan.both_manual:
+            print(
+                "!! 模拟模式：议题是占位内容，没有参考价值；"
+                "两位专家是你手写的，不受影响。\n"
+            )
+        else:
+            print(
+                "!! 模拟模式：模型生成的人格和议题都是占位内容，没有参考价值。\n"
+            )
 
     try:
         author = build_author_backend(mock=args.mock)
-        print("· 正在设计两位专家……")
-        made = authoring.forge(purpose, backend=author, topic_count=args.topics)
+        print("· 两位专家由你提供，跳过人格生成……" if plan.both_manual
+              else "· 正在设计两位专家……")
+        made = authoring.forge(
+            purpose, backend=author, topic_count=args.topics, plan=plan
+        )
     except MissingApiKey as exc:
         print(f"\n[配置缺失] {exc}\n", file=sys.stderr)
         return 2
@@ -138,6 +186,14 @@ def _cmd_run(args: argparse.Namespace) -> int:
         )
         return 2
 
+    if args.blueprint and args.personas_file:
+        print(
+            "\n[参数冲突] 用 --blueprint 时人格已经存在，不能再给 --personas-file。"
+            "想改人格就直接改蓝图 JSON。\n",
+            file=sys.stderr,
+        )
+        return 2
+
     try:
         if args.blueprint:
             bp = blueprint_mod.load(args.blueprint)
@@ -145,12 +201,22 @@ def _cmd_run(args: argparse.Namespace) -> int:
             print(f"目的：{bp.purpose.summary()}")
         else:
             purpose = _purpose_from_args(args)
+            try:
+                plan = _load_persona_plan(args.personas_file)
+            except PersonaSpecError as exc:
+                print(f"\n[人格设定有问题] {exc}\n", file=sys.stderr)
+                return 2
             print(f"目的：{purpose.summary()}")
-            print("· 正在设计两位专家和议题……")
+            print(
+                "· 两位专家由你提供，正在设计议题……"
+                if plan.both_manual
+                else "· 正在设计两位专家和议题……"
+            )
             bp = authoring.forge(
                 purpose,
                 backend=build_author_backend(mock=args.mock),
                 topic_count=args.topics,
+                plan=plan,
             )
             bp = dataclasses.replace(bp, origin="mock" if args.mock else "model")
             # 顺手把蓝图存下来：不然这一轮的人格和议题用完就没了，
@@ -275,6 +341,7 @@ def main(argv: list[str] | None = None) -> int:
         "forge", help="功能一 + 功能二：按目的生成两位专家的人格和一组议题"
     )
     _add_purpose_args(forge)
+    _add_persona_args(forge)
     forge.add_argument(
         "--topics", type=int, default=DEFAULT_TOPIC_COUNT,
         help=f"生成几个正文议题（默认 {DEFAULT_TOPIC_COUNT}，上限 12）",
@@ -291,6 +358,7 @@ def main(argv: list[str] | None = None) -> int:
         help="用之前 forge 出来的蓝图跑；不给就用 --purpose 现生成一份",
     )
     _add_purpose_args(run)
+    _add_persona_args(run)
     run.add_argument(
         "--topics", type=int, default=DEFAULT_TOPIC_COUNT,
         help=f"现生成蓝图时用几个议题（默认 {DEFAULT_TOPIC_COUNT}）",

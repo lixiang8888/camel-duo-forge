@@ -12,7 +12,12 @@ import pytest
 from duo_forge import authoring
 from duo_forge.authoring import AuthoringError, forge, forge_personas, forge_topics
 from duo_forge.backends import ScriptedAuthorBackend, ScriptedBackend
-from duo_forge.personas import CHALLENGER_CONTRACT, Persona, full_system_message
+from duo_forge.personas import (
+    CHALLENGER_CONTRACT,
+    Persona,
+    full_system_message,
+    parse_persona_plan,
+)
 from duo_forge.purpose import Purpose
 from duo_forge.topics import MAX_TOPICS
 
@@ -302,3 +307,187 @@ def test_forge_uses_the_title_the_model_suggested(purpose, author):
     made = forge(bare, backend=author)
     assert made.title
     assert made.purpose.title == ""
+
+
+# ---------------------------------------------------------------------------
+# 用户自定义人格
+# ---------------------------------------------------------------------------
+
+_MANUAL_PROPOSER = {
+    "mode": "manual",
+    "name": "许医师",
+    "title": "三甲医院康复科物理治疗师",
+    "stance": "什么是对的",
+    "system_message": (
+        "【人格】\nUNIQUE_MANUAL_MEMORY_MARKER_9f3c\n\n"
+        "【专业立场】\n先评估再干预。"
+    ),
+}
+
+_MANUAL_CHALLENGER = {
+    "mode": "manual",
+    "name": "老张",
+    "title": "带过两百个程序员的健身教练",
+    "stance": "他到底做不做得到",
+    "system_message": "【人格】\n务实。\n\n【专业立场】\n能坚持的六十分胜过两周的一百分。",
+}
+
+
+class RecordingAuthorBackend(ScriptedAuthorBackend):
+    """记录每次提示词，再交给模拟后端回话。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.seen_prompts: list[str] = []
+
+    def _reply(self, messages):
+        self.seen_prompts.append(
+            " ".join(
+                str(m.get("content", "")) for m in messages if isinstance(m, dict)
+            )
+        )
+        return super()._reply(messages)
+
+
+def test_a_manual_persona_is_used_verbatim(purpose):
+    plan = parse_persona_plan(
+        {
+            "proposer": _MANUAL_PROPOSER,
+            "challenger": {"mode": "hint", "hint": "一位带过很多程序员的实战派教练"},
+        }
+    )
+    made = forge_personas(purpose, backend=ScriptedAuthorBackend(), plan=plan)
+
+    assert made.proposer.name == "许医师"
+    assert made.proposer.title == "三甲医院康复科物理治疗师"
+    assert made.proposer.system_message == _MANUAL_PROPOSER["system_message"].strip()
+    # 另一位仍由模型生成
+    assert made.challenger.name == "挑刺方"
+
+
+def test_the_prompt_gets_the_manual_summary_not_the_whole_memory(purpose):
+    """手写侧的完整背景可能有上万字，不该塞进人格提示词里。"""
+    plan = parse_persona_plan(
+        {
+            "proposer": _MANUAL_PROPOSER,
+            "challenger": {"mode": "hint", "hint": "一位带过很多程序员的实战派教练"},
+        }
+    )
+    backend = RecordingAuthorBackend()
+    forge_personas(purpose, backend=backend, plan=plan)
+
+    prompt = backend.seen_prompts[0]
+    assert "许医师" in prompt
+    assert "三甲医院康复科物理治疗师" in prompt
+    assert "什么是对的" in prompt
+    assert "UNIQUE_MANUAL_MEMORY_MARKER_9f3c" not in prompt
+    assert "一位带过很多程序员的实战派教练" in prompt
+
+
+class OnlyChallengerBackend(ScriptedAuthorBackend):
+    """人格请求只回一半：故意漏掉手写侧。"""
+
+    def _reply(self, messages):
+        text = " ".join(
+            str(m.get("content", "")) for m in messages if isinstance(m, dict)
+        )
+        if '"proposer"' in text:
+            self._calls += 1
+            return json.dumps(
+                {
+                    "title": "只回了一半",
+                    "slug": "half",
+                    "challenger": {
+                        "name": "乙",
+                        "title": "身份乙",
+                        "stance": "立场乙",
+                        "system_message": "【人格】\n乙",
+                    },
+                },
+                ensure_ascii=False,
+            )
+        return super()._reply(messages)
+
+
+def test_a_missing_manual_side_in_the_model_output_is_fine(purpose):
+    """模型不需要复述用户手写的那位；漏掉不该触发重试。"""
+    plan = parse_persona_plan(
+        {"proposer": _MANUAL_PROPOSER, "challenger": {"mode": "auto"}}
+    )
+    made = forge_personas(purpose, backend=OnlyChallengerBackend(), plan=plan)
+
+    assert made.proposer.name == "许医师"
+    assert made.challenger.name == "乙"
+    assert made.title == "只回了一半"
+
+
+class ExplodingBackend(ScriptedBackend):
+    def _reply(self, messages):
+        raise AssertionError("两位都手写时不该调用人格模型")
+
+
+def test_both_manual_makes_no_persona_call(purpose):
+    plan = parse_persona_plan(
+        {"proposer": _MANUAL_PROPOSER, "challenger": _MANUAL_CHALLENGER}
+    )
+    made = forge_personas(purpose, backend=ExplodingBackend(), plan=plan)
+
+    assert made.proposer.name == "许医师"
+    assert made.challenger.name == "老张"
+    assert made.title == purpose.title  # 用户给了标题就用
+    assert made.slug
+
+
+def test_both_manual_without_a_title_falls_back(purpose):
+    bare = Purpose(text=purpose.text, title="")
+    plan = parse_persona_plan(
+        {"proposer": _MANUAL_PROPOSER, "challenger": _MANUAL_CHALLENGER}
+    )
+    made = forge_personas(bare, backend=ExplodingBackend(), plan=plan)
+
+    assert made.title == "对谈成果"
+    assert made.slug == "duo"
+
+
+def test_forge_with_both_manual_only_calls_the_topic_model(purpose):
+    plan = parse_persona_plan(
+        {"proposer": _MANUAL_PROPOSER, "challenger": _MANUAL_CHALLENGER}
+    )
+    backend = RecordingAuthorBackend()
+    made = forge(purpose, backend=backend, plan=plan)
+
+    assert backend._calls == 1, "人格由用户提供，只剩议题那一次调用"
+    assert made.personas[0].name == "许医师"
+    assert made.personas[1].name == "老张"
+
+
+class DisciplineThenGoodBackend(ScriptedAuthorBackend):
+    """第一次回带纪律标记的人格，第二次回干净的。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._n = 0
+        self.seen_prompts: list[str] = []
+
+    def _reply(self, messages):
+        self.seen_prompts.append(
+            " ".join(
+                str(m.get("content", "")) for m in messages if isinstance(m, dict)
+            )
+        )
+        self._n += 1
+        if self._n == 1:
+            self._calls += 1
+            bad = json.loads(json.dumps(_GOOD_PERSONAS, ensure_ascii=False))
+            bad["proposer"]["system_message"] += "\n【发言纪律】\n不要写这一段。"
+            return json.dumps(bad, ensure_ascii=False)
+        return super()._reply(messages)
+
+
+def test_generated_discipline_is_rejected_and_retried(purpose):
+    backend = DisciplineThenGoodBackend()
+    made = forge_personas(purpose, backend=backend)
+
+    assert backend._n == 2
+    assert "【发言纪律】" not in made.proposer.system_message
+    assert "发言纪律" in backend.seen_prompts[1]  # 重试提示里说清了哪里错

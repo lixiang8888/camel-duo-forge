@@ -34,11 +34,19 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Callable, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 from camel.agents import ChatAgent
 
-from .personas import Persona
+from .personas import (
+    DISCIPLINE_MARKERS,
+    MAX_NAME,
+    MAX_PERSONA_TITLE,
+    MAX_STANCE,
+    MAX_SYSTEM_MESSAGE,
+    Persona,
+    PersonaPlan,
+)
 from .purpose import Purpose
 from .topics import (
     DEFAULT_TOPIC_COUNT,
@@ -50,21 +58,21 @@ from .topics import (
     Topic,
 )
 
+if TYPE_CHECKING:  # 只为类型标注，运行时不导入（避免把 blueprint 拖进 camel 路径）
+    from .blueprint import Blueprint
+
 __all__ = [
     "AuthoringError",
     "DEFAULT_TOPIC_COUNT",
     "ForgedPersonas",
+    "assemble_blueprint",
     "forge",
     "forge_personas",
     "forge_topics",
 ]
 
-#: 生成人格时各字段的长度上限。`system_message` 是唯一一个给了很大余量的——
-#: 人格写细一点是好事，而且它只在每个议题的 system message 里出现一次。
-MAX_NAME = 20
-MAX_PERSONA_TITLE = 60
-MAX_STANCE = 40
-MAX_SYSTEM_MESSAGE = 4000
+# 长度上限统一放在 personas.py（那里不依赖 camel，CLI / launcher 校验时也能用）。
+# 这里 import 进来，现有的 `authoring.MAX_*` 引用仍然成立。
 
 #: 生成失败时重试几次。两次足够——格式错是偶发的，两次都错说明是提示词的问题。
 _MAX_ATTEMPTS = 2
@@ -264,11 +272,22 @@ def _slug(raw: Any, fallback: str) -> str:
 def _parse_persona(raw: Any, label: str) -> Persona:
     if not isinstance(raw, dict):
         raise AuthoringError(f"{label}必须是一个 JSON 对象。")
+    message = _field(
+        raw, "system_message", f"{label}的人格设定", MAX_SYSTEM_MESSAGE
+    )
+    # 提示词已经要求模型只写三块，但 hint 有可能诱导它把纪律也写进来。
+    # 纪律是机器契约，必须只由代码追加一次。
+    for marker in DISCIPLINE_MARKERS:
+        if marker in message:
+            raise AuthoringError(
+                f"{label}的人格设定里出现了「{marker}」。"
+                "发言纪律和收手纪律由系统追加，不要写进人格设定。"
+            )
     return Persona(
         name=_field(raw, "name", f"{label}的称呼", MAX_NAME),
         title=_field(raw, "title", f"{label}的身份", MAX_PERSONA_TITLE),
         stance=_field(raw, "stance", f"{label}负责什么", MAX_STANCE),
-        system_message=_field(raw, "system_message", f"{label}的人格设定", MAX_SYSTEM_MESSAGE),
+        system_message=message,
     )
 
 
@@ -286,13 +305,55 @@ class ForgedPersonas:
         return (self.proposer, self.challenger)
 
 
-def _parse_personas(raw: dict) -> ForgedPersonas:
+def _parse_personas(
+    raw: dict, *, plan: PersonaPlan | None = None
+) -> ForgedPersonas:
+    """只解析模型需要生成的那几位；manual 侧直接取用户给的，不理会模型写了什么。
+
+    这样即使模型漏写/写坏了手写侧，也不会触发一次无意义的重试。
+    """
+    plan = plan or PersonaPlan()
+    proposer = (
+        plan.proposer.to_persona()
+        if plan.proposer.mode == "manual"
+        else _parse_persona(raw.get("proposer"), "第一位专家（proposer）")
+    )
+    challenger = (
+        plan.challenger.to_persona()
+        if plan.challenger.mode == "manual"
+        else _parse_persona(raw.get("challenger"), "第二位专家（challenger）")
+    )
     return ForgedPersonas(
         title=_field(raw, "title", "成果物标题", 60),
         slug=_slug(raw.get("slug"), "duo"),
-        proposer=_parse_persona(raw.get("proposer"), "第一位专家（proposer）"),
-        challenger=_parse_persona(raw.get("challenger"), "第二位专家（challenger）"),
+        proposer=proposer,
+        challenger=challenger,
     )
+
+
+def _plan_prompt_block(plan: PersonaPlan) -> str:
+    """把用户的人格意图拼进人格提示词。
+
+    手写侧只给 `name/title/stance` 摘要——**不**注入完整 `system_message`。
+    那段可能有上万字，塞进这里既贵，也扩大提示词注入面；对方只要能看懂
+    他「是谁、负责什么」就够了。
+    """
+    lines: list[str] = []
+    for side, spec, label in (
+        ("proposer", plan.proposer, "第一位专家（proposer）"),
+        ("challenger", plan.challenger, "第二位专家（challenger）"),
+    ):
+        if spec.mode == "manual":
+            lines.append(
+                f"- {label}由用户指定，必须原样采用：称呼「{spec.name}」，"
+                f"身份「{spec.title}」，负责「{spec.stance}」。"
+                "你要设计的另一位必须与它形成真正的对立。"
+            )
+        elif spec.mode == "hint":
+            lines.append(f"- {label}请按这个方向设计：{spec.hint}")
+    if not lines:
+        return ""
+    return "\n\n【用户对人格的额外要求】\n" + "\n".join(lines)
 
 
 def _parse_topics(raw: dict) -> tuple[Topic, ...]:
@@ -374,12 +435,36 @@ def _ask_json(
     raise AuthoringError(f"{what}生成失败：{last_error}")
 
 
-def forge_personas(purpose: Purpose, *, backend) -> ForgedPersonas:
-    """功能一：按目的生成两位立场对立的专家（外加大标题）。"""
+def forge_personas(
+    purpose: Purpose, *, backend, plan: PersonaPlan | None = None
+) -> ForgedPersonas:
+    """功能一：按目的生成两位立场对立的专家（外加大标题）。
+
+    `plan` 里标记为 `manual` 的侧不交给模型。两位都 manual 时**一次人格模型调用都
+    不发**：只返回 `purpose.title`（或「对谈成果」）当标题，议题仍由 `forge_topics`
+    生成。只改一位时仍要调用一次人格模型——它至少还得生成另一位和标题。
+    """
+    plan = plan or PersonaPlan()
+    if plan.both_manual:
+        title = purpose.title or "对谈成果"
+        return ForgedPersonas(
+            title=title,
+            slug=_slug(title, "duo"),
+            proposer=plan.proposer.to_persona(),
+            challenger=plan.challenger.to_persona(),
+        )
+
     hint = PERSONA_TITLE_HINT.format(title=purpose.title) if purpose.title else ""
     prompt = PERSONA_PROMPT.format(purpose=purpose.text, title_hint=hint)
+    # 全 auto 时这里返回空串，提示词与改动前逐字一致。
+    prompt += _plan_prompt_block(plan)
     agent = ChatAgent(system_message=PERSONA_SYSTEM, model=backend)
-    return _ask_json(agent, prompt, _parse_personas, what="人格")
+    return _ask_json(
+        agent,
+        prompt,
+        lambda raw: _parse_personas(raw, plan=plan),
+        what="人格",
+    )
 
 
 def forge_topics(
@@ -409,24 +494,44 @@ def forge_topics(
     return _ask_json(agent, prompt, _parse_topics, what="议题")
 
 
-def forge(
-    purpose: Purpose, *, backend, topic_count: int = DEFAULT_TOPIC_COUNT
-):
-    """两次调用合起来：目的 → 蓝图（标题 + 两位专家 + 一组议题）。
+def assemble_blueprint(
+    purpose: Purpose,
+    forged: ForgedPersonas,
+    topics: Sequence[Topic],
+    *,
+    origin: str = "",
+) -> "Blueprint":
+    """把两段生成结果拼成蓝图。
 
-    返回值是 `blueprint.Blueprint`。这里用**函数内 import**，是为了让本模块
-    之外的地方（比如 `show` 子命令）能只 import `blueprint` 而不拖进 camel。
+    `forge` 和网页启动器共用这一份，避免「标题取谁」这类规则两边各写一遍。
+    函数内 import 是为了让 `show` 子命令只 import blueprint 而不拖进 camel。
     """
     from .blueprint import Blueprint
 
-    forged = forge_personas(purpose, backend=backend)
-    topics = forge_topics(
-        purpose, forged.pair, backend=backend, count=topic_count
-    )
     return Blueprint(
         purpose=purpose,
         title=purpose.title or forged.title,
         slug=forged.slug,
         personas=forged.pair,
-        topics=topics,
+        topics=tuple(topics),
+        origin=origin,
     )
+
+
+def forge(
+    purpose: Purpose,
+    *,
+    backend,
+    topic_count: int = DEFAULT_TOPIC_COUNT,
+    plan: PersonaPlan | None = None,
+) -> "Blueprint":
+    """目的 → 蓝图（标题 + 两位专家 + 一组议题）。
+
+    正常是两次模型调用；只改一位仍是两次（人格 + 议题）；两位都手写时只有一次
+    （议题）。返回值是 `blueprint.Blueprint`。
+    """
+    forged = forge_personas(purpose, backend=backend, plan=plan)
+    topics = forge_topics(
+        purpose, forged.pair, backend=backend, count=topic_count
+    )
+    return assemble_blueprint(purpose, forged, topics)

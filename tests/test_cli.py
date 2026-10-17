@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -178,6 +179,123 @@ def test_run_from_a_purpose_saves_the_blueprint_it_used(tmp_path, capsys):
     )
     assert list(out.glob("*.json")), "蓝图没落盘"
     assert "蓝图已存" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# 自定义人格
+# ---------------------------------------------------------------------------
+
+_MANUAL_PERSONAS = {
+    "proposer": {
+        "mode": "manual",
+        "name": "许医师",
+        "title": "三甲医院康复科物理治疗师",
+        "stance": "什么是对的",
+        "system_message": (
+            "【人格】\n只认证据。\n\n【专业立场】\n先评估再干预。\n\n"
+            "【你的盲区，不要掩饰】\n方案偏理想。\n\n"
+            "【长期背景与案例】\n看过的典型病例都在这里。"
+        ),
+    },
+    "challenger": {
+        "mode": "hint",
+        "hint": "一位带过很多程序员的实战派教练",
+    },
+}
+
+
+def _write_personas(tmp_path, data) -> Path:
+    path = tmp_path / "personas.json"
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def test_forge_accepts_a_personas_file(tmp_path):
+    out = tmp_path / "out"
+    path = _write_personas(tmp_path, _MANUAL_PERSONAS)
+
+    assert (
+        main(
+            [
+                "forge", "--purpose", PURPOSE, "--mock",
+                "--out", str(out), "--personas-file", str(path),
+            ]
+        )
+        == 0
+    )
+
+    made = blueprint_mod.load(next(out.glob("*.json")))
+    assert made.personas[0].name == "许医师"
+    assert "【长期背景与案例】" in made.personas[0].system_message
+    # 另一位是 hint，由 mock 后端生成
+    assert made.personas[1].name == "挑刺方"
+
+
+def test_forge_reports_a_missing_personas_file(tmp_path, capsys):
+    code = main(
+        [
+            "forge", "--purpose", PURPOSE, "--mock",
+            "--personas-file", str(tmp_path / "nope.json"),
+        ]
+    )
+    assert code == 2
+    assert "读不出人格文件" in capsys.readouterr().err
+
+
+def test_forge_rejects_an_invalid_personas_file_without_writing(tmp_path, capsys):
+    out = tmp_path / "out"
+    path = _write_personas(
+        tmp_path, {"proposer": {"mode": "manual", "name": "只有名字"}}
+    )
+
+    code = main(
+        [
+            "forge", "--purpose", PURPOSE, "--mock",
+            "--out", str(out), "--personas-file", str(path),
+        ]
+    )
+    assert code == 2
+    assert "第一位专家" in capsys.readouterr().err
+    assert not out.exists() or not list(out.glob("*"))
+
+
+def test_run_from_a_purpose_accepts_a_personas_file(tmp_path):
+    out = tmp_path / "out"
+    path = _write_personas(
+        tmp_path,
+        {
+            "proposer": _MANUAL_PERSONAS["proposer"],
+            "challenger": _MANUAL_PERSONAS["proposer"] | {"name": "老张"},
+        },
+    )
+
+    assert (
+        main(
+            [
+                "run", "--purpose", PURPOSE, "--mock", "--rounds", "1",
+                "--out", str(out), "--personas-file", str(path),
+            ]
+        )
+        == 0
+    )
+    made = blueprint_mod.load(next(out.glob("*.json")))
+    assert made.personas[0].name == "许医师"
+    assert made.personas[1].name == "老张"
+
+
+def test_run_with_blueprint_and_personas_file_is_refused(tmp_path, capsys):
+    _forge(tmp_path)
+    bp_path = next(tmp_path.glob("*.json"))
+    path = _write_personas(tmp_path, {})
+
+    code = main(
+        [
+            "run", "--blueprint", str(bp_path),
+            "--personas-file", str(path), "--mock",
+        ]
+    )
+    assert code == 2
+    assert "--personas-file" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------
