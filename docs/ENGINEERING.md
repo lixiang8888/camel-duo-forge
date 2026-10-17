@@ -11,6 +11,7 @@
 - [七、换模型](#七换模型)
 - [八、踩坑记录（搬运时一并带过来的）](#八踩坑记录搬运时一并带过来的)
 - [九、测试](#九测试)
+- [十、网页启动器](#十网页启动器)
 
 ---
 
@@ -47,7 +48,7 @@ src/duo_forge/
 ├── purpose.py     目的：整个项目唯一的输入
 ├── authoring.py   ★ 功能一 + 功能二：目的 → 两位专家 + 一组议题
 ├── blueprint.py   ★ 蓝图：落盘、读回、给人看的版本
-├── personas.py    Persona 的形状 + 由代码拥有的发言纪律
+├── personas.py    Persona 的形状、发言纪律、自定义人格的解析与校验
 ├── topics.py      Topic 的形状 + 长度上限 + 收尾议题
 ├── society.py     ★ CAMEL RolePlaying 编排
 ├── digest.py      对话 → 正文/附录 → 一页速查
@@ -80,7 +81,7 @@ src/duo_forge/
 | `config.py` | `config.py` | 照搬，多一个 `build_author_backend`（低温） |
 | `profile.py`（读者档案） | —— | **没搬**。它是健身场景的产物（身高体重换算 BMI、蛋白质克数） |
 | `fooddata.py` + CSV（成分表） | —— | **没搬**。同上，领域专用 |
-| `launcher.py`（网页版） | —— | **没搬**。纯前端，和泛化这件事无关 |
+| `launcher.py`（网页版） | `launcher.py` | 搬了，但改成两段式：forge → 审蓝图 → run（见第十节） |
 | `tools/build_food_table.py` | —— | **没搬**。建的是上面那张表 |
 
 没搬的三样都不是「来不及」，而是它们本来就绑在健身饮食上。要做的话，
@@ -135,6 +136,28 @@ src/duo_forge/
 `forge_topics` 只生成**正文议题**，收尾议题由 `topics.closing_topic` 按代码造。
 理由不是偷懒：收尾议题的输入是前面**全部**对话（它要写「你们哪些地方没谈拢」），
 形状和普通议题本来就不一样。交给模型生成，只会得到一个和普通议题重复的东西。
+
+### 用户自定义人格
+
+`personas.py` 里有一层不依赖 camel 的解析：`PersonaSpec` / `PersonaPlan` /
+`parse_persona_plan`。CLI 和网页启动器共用它，两边不会各有一套校验。
+
+每位专家独立选 `auto` / `hint` / `manual`。生成时：
+
+- **保持完整的人格 JSON schema**（提示词里仍有 `"proposer"`，`ScriptedAuthorBackend`
+  靠它识别请求）。只解析模型该生成的那几位；`manual` 侧直接取用户给的 `Persona`，
+  模型漏写/写坏它也不会触发重试。
+- 提示词里只放 `manual` 侧的 `name/title/stance` 摘要，**不**注入完整
+  `system_message`。那段可能有上万字，塞进去既贵，也扩大提示词注入面。
+- 两位都 `manual` 时**一次人格调用都不发**，标题取 `purpose.title`，没有就
+  「对谈成果」/ slug `duo`；议题照常生成。
+- 手写上限 `MAX_MANUAL_SYSTEM_MESSAGE = 12000`，和模型生成的 4000 是两回事。
+  蓝图加载器仍然宽松（蓝图是给人手改的），这个上限只在创建时把关。
+- 纪律检查扩到了生成结果：模型或 hint 即使把【发言纪律】【收手纪律】写进人格，
+  也会被拒绝并带着具体错误重试。
+
+「人格记忆」没有独立字段，就是人格设定里的一段长期背景与案例——最简单直接的注入口。
+它只在创建时受 12000 字限制，并且会随每个议题、每一轮进入模型调用，成本随长度线性上升。
 
 ---
 
@@ -201,6 +224,10 @@ src/duo_forge/
 2. 收手那轮的发言**先记录再判断**，一个字都不丢。另外 `RolePlaying.step()` 一轮
    往返中途掐不断，所以收手总落在**轮次边界**上，记录里每一轮都是完整对称的。
 3. `--no-converge` 一键回到死板跑满。
+
+> 顺带修了一个和收尾议题有关的旧 bug：`Blueprint.select` 以前在 `--only` 只选部分
+> 议题时，收尾议题仍按蓝图里**全部**议题数生成开场白（「我们前面谈了 N 个」）。
+> 现在按本次选中的数量算，网页的议题勾选和命令行的 `--only` 都受益。
 
 > 顺带记一笔：`society.py` 里 `if assistant_response.terminated or ...: break` 这行
 > **在我们这套配置下永远不会触发**。camel 的 `ChatAgent` 默认不装任何
@@ -296,15 +323,17 @@ tiktoken 会去 `openaipublic.blob.core.windows.net` **下载**——那个域�
 uv run pytest
 ```
 
-107 条，全部离线（用的是模拟后端，不花钱、不联网）。六个文件各管一层：
+189 条，全部离线（用的是模拟后端，不花钱、不联网）。八个文件各管一层：
 
 | 文件 | 管什么 |
 |---|---|
-| `tests/test_authoring.py` | JSON 抽取的各种形态、字段校验、重试、`forge` 合起来 |
-| `tests/test_blueprint.py` | JSON 往返、给人看的那份、`--only` 语义、错误提示 |
+| `tests/test_authoring.py` | JSON 抽取的各种形态、字段校验、重试、自定义人格、`forge` 合起来 |
+| `tests/test_blueprint.py` | JSON 往返、给人看的那份、`--only` 语义、长人格、围栏、重名 |
+| `tests/test_personas.py` | 自定义人格的解析矩阵：mode、必填、长度、纪律标记、结构错误 |
 | `tests/test_purpose.py` | 目的的长度边界、从文件读、标题行 |
 | `tests/test_society.py` | 轮次与顺序、提前收手的全套判据、整理与拼装 |
 | `tests/test_pipeline_run.py` | 端到端跑一遍：落盘、钩子、收手开关 |
+| `tests/test_launcher.py` | 广播、HTTP 路由、两段式准入、keep-alive、停止不写文件 |
 | `tests/test_cli.py` | 三个子命令跑得通，参数给错时报的是人话 |
 
 几条值得知道的：
@@ -322,3 +351,79 @@ uv run pytest
   将来谁把 mock 的文案改成含「无异议」，它会先红。
 - `test_authoring.py` 里 `FlakyBackend` 第一次回一段没用的东西、第二次回合法 JSON，
   用来验证重试真的会发生、且**重试提示里带着具体的错**。
+
+---
+
+## 十、网页启动器
+
+`launcher.py` 在仓库根目录，是给「不想敲命令」的人用的本地网页界面。它**不是第二套
+业务逻辑**：forge 调 `authoring`，run 调 `pipeline`，和 CLI 完全相同。
+
+### 为什么是两段式
+
+`forge` 要花两次模型调用，而蓝图本来就是给人审、给人改的。所以页面有明确的两步：
+**锻造蓝图 → 审阅/勾选议题 → 开始对谈**。不做「一个按钮从头跑到尾」——议题不满意时
+重跑一整轮的钱白花了。
+
+网页**不加载** `blueprints/` 下的历史蓝图：复用蓝图是命令行的用法
+（`duo-forge run --blueprint`）。页面只跑当次 forge 出来的那一份，状态简单得多。
+
+### 分层红线
+
+`launcher.py` 可以 import `duo_forge.*`，但 `duo_forge` 里的任何模块都不 import
+launcher。所以没有浏览器、没有 Windows 的机器上，`duo-forge run` 照样能跑。
+根目录的 launcher.py 也不进 wheel（`pyproject.toml` 只打包 `src/duo_forge`）。
+
+### 线程模型与准入锁
+
+```
+HTTP 线程池（ThreadingHTTPServer）
+   ├─ GET  /events   → 阻塞在订阅队列上，逐条 SSE 写出
+   └─ POST /stop     → job.request_stop()
+
+daemon worker 线程：同步调用 authoring / pipeline
+   └─ 各 hook → bus.publish(...)
+```
+
+- worker 线程里**一个 HTTP 调用都不发**，只往广播里放事件。
+- worker 是 daemon 且**永不 join**：关页面不该等模型把这一轮跑完。
+- **准入必须加锁**。`server._lock` 保护「检查是否有任务在跑 → 构造 job → 赋值」这
+  三步；否则两个 `/forge`（或 `/forge` 撞 `/run`）会同时通过检查，起两个付费 worker。
+  `job.start()` 在锁外调用。锁序单向：`server._lock` → `_Bus._lock`。
+- **终态事件先于 `finished.set()`**。反过来的话，新 job 的 `bus.reset()` 可能夹在
+  中间，旧 job 的 `done` 会落进新 job 的历史里。
+- forge 没有 stop 钩子：`/stop` 只置 `cancelled`，worker 在调用返回后检查
+  「是否被取消 / 是否已被新 job 取代」，命中就丢弃结果、不落盘、不赋值。
+  页面上明说「无法掐断正在进行的调用」。
+
+### 两段之间的交接
+
+只有两样东西：`server.blueprint` 和一次 `bus.reset()`。
+
+- forge worker 在**锁内**把蓝图赋给 `server.blueprint`，**先赋值再广播** `forge_done`
+  ——页面收到事件后可能立刻 POST `/run`。
+- run 在准入时把 `(blueprint, topics)` 快照进 job，worker 不再回头读
+  `server.blueprint`。否则一次新的 forge 会把正在跑的这一轮换掉。
+- 议题选择复用 `Blueprint.select`。注意 `select("")` 的语义是「全部」，所以空选择
+  必须在路由里先拒绝；`run_pipeline(topics=[])` 也会把空列表当成全部。
+
+### 几个从命令行带过来的硬约束
+
+- **HTTP/1.1 keep-alive**：每个 POST 在任何提前返回前都要把请求体读干净。没读完的
+  字节会粘到下一请求的请求行上（表现为 `501 Unsupported method ('{...}GET')`）。
+- **状态行必须 ASCII**：`send_error` 的 reason 按 latin-1 编码，中文会直接抛
+  `UnicodeEncodeError`。
+- **SSE 连接永不主动关闭**：`done` 之后断开会让 EventSource 重连、拿到历史、再断开，
+  变成无限重连。前端用单调递增的 `seq` 去重。
+- **单实例**：`/health` 报 `_APP_ID`，启动时扫 11 个端口；重复双击只把浏览器指过去。
+  默认端口 8785，和前作的 8775、autogen 的 8765 错开。
+- **mock 下收手恒关**：这仍然是 `pipeline.run_pipeline` 的职责，launcher 不重复判断。
+
+### 一键启动的两个入口
+
+- `run.sh`：无子命令（或只给选项）时起网页版；`forge`/`run`/`show` 原样透传给 CLI。
+  启动器模式没有 API key 只警告不退出——用户还能在页面里勾 mock。
+- `make_shortcut.py`：在 Windows 桌面建 `.lnk`，目标
+  `wsl.exe -d <distro> --cd <项目> -- .venv/bin/python launcher.py`。
+  用直接解释器而不是 `uv run`（秒起、不解析环境）；`.lnk` 内嵌本机发行版名和绝对
+  路径，所以不入库（`*.lnk`）。
