@@ -64,7 +64,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
 
-from duo_forge import authoring, pipeline
+from duo_forge import pipeline
 from duo_forge.blueprint import Blueprint, BlueprintError
 from duo_forge.config import (
     BLUEPRINT_DIR,
@@ -172,6 +172,8 @@ class _Job:
     """
 
     kind = "job"
+    #: 出错时终端/页面上的标签。子类覆盖。
+    failure_label = "任务失败"
 
     def __init__(self, bus: _Bus) -> None:
         self.bus = bus
@@ -192,6 +194,30 @@ class _Job:
     def _worker(self) -> None:  # pragma: no cover - 子类实现
         raise NotImplementedError
 
+    def _emit(self, event_type: str, **fields) -> None:
+        """发一条事件。`job` 字段统一从这里注入，子类不再手写。
+
+        参数名避开 `kind`：notice 事件自己带一个 `kind`（warning/final）。
+        """
+        self.bus.publish({"type": event_type, "job": self.kind, **fields})
+
+    def _fail(self, text: str, *, full: bool = True) -> None:
+        """把错误放上页面；`full=True` 时完整内容留在终端（网页只放首行）。"""
+        print(f"\n[{self.failure_label}]\n{text}\n", file=sys.stderr, flush=True)
+        if full:
+            first = text.splitlines()[0] if text else "未知错误"
+            if len(first) > 300:
+                first = first[:300] + "…"
+            text = f"{first}（完整信息见终端）"
+        self._emit("notice", kind="warning", text=text)
+
+    def _finish(self) -> None:
+        """终态事件先 publish，再 `finished.set()`——顺序不能反。"""
+        try:
+            self._emit("done")
+        finally:
+            self.finished.set()
+
 
 class _ForgeJob(_Job):
     """目的 → 蓝图。
@@ -201,6 +227,7 @@ class _ForgeJob(_Job):
     """
 
     kind = "forge"
+    failure_label = "锻造失败"
 
     def __init__(
         self,
@@ -224,51 +251,41 @@ class _ForgeJob(_Job):
         with self.server._lock:
             return self.cancelled.is_set() or self.server.job is not self
 
+    def _cancel_if_needed(self) -> bool:
+        if not self._cancelled_or_superseded():
+            return False
+        self._emit("forge_cancelled", text="已取消。蓝图没有保存。")
+        return True
+
     def _worker(self) -> None:
-        bus = self.bus
         try:
-            bus.publish(
-                {
-                    "type": "forge_start",
-                    "job": "forge",
-                    "purpose": self.purpose.summary(),
-                    "topics": self.topic_count,
-                    "mock": self.mock,
-                }
+            from duo_forge import authoring  # 惰性 import：会拖进 camel
+
+            self._emit(
+                "forge_start",
+                purpose=self.purpose.summary(),
+                topics=self.topic_count,
+                mock=self.mock,
             )
             backend = build_author_backend(mock=self.mock)
 
             # 两位都手写时没有「设计专家」这一步，别在页面上报一个不存在的阶段。
             if not self.plan.both_manual:
-                bus.publish({"type": "forge_stage", "job": "forge", "stage": "personas"})
+                self._emit("forge_stage", stage="personas")
             forged = authoring.forge_personas(
                 self.purpose, backend=backend, plan=self.plan
             )
-            if self._cancelled_or_superseded():
-                bus.publish(
-                    {
-                        "type": "forge_cancelled",
-                        "job": "forge",
-                        "text": "已取消。蓝图没有保存。",
-                    }
-                )
+            if self._cancel_if_needed():
                 return
 
-            bus.publish({"type": "forge_stage", "job": "forge", "stage": "topics"})
+            self._emit("forge_stage", stage="topics")
             topics = authoring.forge_topics(
                 self.purpose,
                 forged.pair,
                 backend=backend,
                 count=self.topic_count,
             )
-            if self._cancelled_or_superseded():
-                bus.publish(
-                    {
-                        "type": "forge_cancelled",
-                        "job": "forge",
-                        "text": "已取消。蓝图没有保存。",
-                    }
-                )
+            if self._cancel_if_needed():
                 return
 
             # 标题/slug 的规则只有 authoring.assemble_blueprint 一份，
@@ -280,9 +297,7 @@ class _ForgeJob(_Job):
                 origin="mock" if self.mock else "model",
             )
 
-            json_path = bp.save(self.server.blueprint_dir)
-            md_path = json_path.with_suffix(".md")
-            md_path.write_text(bp.to_markdown(), encoding="utf-8")
+            json_path, _ = bp.save_bundle(self.server.blueprint_dir)
 
             with self.server._lock:
                 if self.cancelled.is_set() or self.server.job is not self:
@@ -290,41 +305,25 @@ class _ForgeJob(_Job):
                     return
                 self.server.blueprint = bp
                 self.server.blueprint_path = json_path
-                self.server.blueprint_md_path = md_path
 
             # 先赋值、再广播：页面收到 forge_done 后可能立刻 POST /run。
-            bus.publish(
-                {
-                    "type": "forge_done",
-                    "job": "forge",
-                    "blueprint": _blueprint_payload(bp, json_path),
-                }
+            self._emit(
+                "forge_done",
+                blueprint=_blueprint_payload(bp, json_path),
             )
         except MissingApiKey as exc:
             self._fail(str(exc).strip(), full=False)
         except Exception as exc:  # noqa: BLE001
             self._fail(str(exc).strip())
         finally:
-            # 顺序不能反：先让页面看到终态，再允许下一个 job 起来。
-            try:
-                bus.publish({"type": "done", "job": "forge"})
-            finally:
-                self.finished.set()
-
-    def _fail(self, text: str, *, full: bool = True) -> None:
-        print(f"\n[锻造失败]\n{text}\n", file=sys.stderr, flush=True)
-        if full:
-            first = text.splitlines()[0] if text else "未知错误"
-            if len(first) > 300:
-                first = first[:300] + "…"
-            text = f"{first}（完整信息见终端）"
-        self.bus.publish({"type": "notice", "job": "forge", "kind": "warning", "text": text})
+            self._finish()
 
 
 class _RunJob(_Job):
     """蓝图 → 对谈 → 成果。"""
 
     kind = "run"
+    failure_label = "运行失败"
 
     def __init__(
         self,
@@ -346,104 +345,82 @@ class _RunJob(_Job):
         self.mock = mock
         self.converge = converge
         self.out_dir = Path(out_dir)
-
-        self.handbook = ""
-        self.handbook_path: Optional[Path] = None
-        self.quick = ""
-        self.quick_path: Optional[Path] = None
-        self.transcript_text = ""
-        self.transcript_path: Optional[Path] = None
+        #: run_pipeline 的完整结果。下载路由直接从这里取正文与路径，
+        #: 不再把六个字段逐个镜像一遍。
+        self.result: Optional[pipeline.RunResult] = None
 
     def _hooks(self) -> pipeline.PipelineHooks:
-        bus = self.bus
+        emit = self._emit
         proposer = self.blueprint.proposer
         challenger = self.blueprint.challenger
 
         def run_start(total: int, rounds: int) -> None:
-            bus.publish(
-                {
-                    "type": "run_start",
-                    "job": "run",
-                    "total": total,
-                    "rounds": rounds,
-                    "mock": self.mock,
-                    "converge": self.converge,
-                    "topics": [
-                        {"key": t.key, "title": t.section_title} for t in self.topics
-                    ],
-                    "proposer": {
-                        "name": proposer.name,
-                        "title": proposer.title,
-                        "stance": proposer.stance,
-                    },
-                    "challenger": {
-                        "name": challenger.name,
-                        "title": challenger.title,
-                        "stance": challenger.stance,
-                    },
-                }
+            emit(
+                "run_start",
+                total=total,
+                rounds=rounds,
+                mock=self.mock,
+                converge=self.converge,
+                topics=[
+                    {"key": t.key, "title": t.section_title} for t in self.topics
+                ],
+                proposer={
+                    "name": proposer.name,
+                    "title": proposer.title,
+                    "stance": proposer.stance,
+                },
+                challenger={
+                    "name": challenger.name,
+                    "title": challenger.title,
+                    "stance": challenger.stance,
+                },
             )
 
         def topic_start(index: int, total: int, topic) -> None:
-            bus.publish(
-                {
-                    "type": "topic_start",
-                    "job": "run",
-                    "index": index,
-                    "total": total,
-                    "key": topic.key,
-                    "title": topic.section_title,
-                }
+            emit(
+                "topic_start",
+                index=index,
+                total=total,
+                key=topic.key,
+                title=topic.section_title,
             )
 
         def turn(topic, t) -> None:
-            bus.publish(
-                {
-                    "type": "turn",
-                    "job": "run",
-                    "topic": topic.key,
-                    "speaker": t.speaker,
-                    "side": "a" if t.speaker == proposer.name else "b",
-                    "text": t.content,
-                }
+            emit(
+                "turn",
+                topic=topic.key,
+                speaker=t.speaker,
+                side="a" if t.speaker == proposer.name else "b",
+                text=t.content,
             )
 
         def topic_done(topic, transcript) -> None:
-            bus.publish(
-                {
-                    "type": "topic_done",
-                    "job": "run",
-                    "topic": topic.key,
-                    "turns": len(transcript.turns),
-                    "early": transcript.stopped_early,
-                    "roundsRun": transcript.rounds_run,
-                }
+            emit(
+                "topic_done",
+                topic=topic.key,
+                turns=len(transcript.turns),
+                early=transcript.stopped_early,
+                roundsRun=transcript.rounds_run,
             )
 
         def section_start(topic, is_closing: bool) -> None:
-            bus.publish(
-                {
-                    "type": "section_start",
-                    "job": "run",
-                    "topic": topic.key,
-                    "title": topic.section_title,
-                    "closing": is_closing,
-                }
+            emit(
+                "section_start",
+                topic=topic.key,
+                title=topic.section_title,
+                closing=is_closing,
             )
 
         def section_done(topic, is_closing: bool, markdown: str) -> None:
-            bus.publish(
-                {
-                    "type": "section_done",
-                    "job": "run",
-                    "topic": topic.key,
-                    "title": topic.section_title,
-                    "closing": is_closing,
-                }
+            emit(
+                "section_done",
+                topic=topic.key,
+                title=topic.section_title,
+                closing=is_closing,
             )
 
         def quick_start() -> None:
-            bus.publish({"type": "quick_start", "job": "run"})
+            emit("quick_start")
 
         return pipeline.PipelineHooks(
             on_run_start=run_start,
@@ -456,7 +433,6 @@ class _RunJob(_Job):
         )
 
     def _worker(self) -> None:
-        bus = self.bus
         try:
             backend = build_backend(mock=self.mock)
             result = pipeline.run_pipeline(
@@ -471,50 +447,25 @@ class _RunJob(_Job):
                 converge=self.converge,
             )
             # 先赋值、再广播 run_done：页面收到它之后会立刻来取这三份正文。
-            self.handbook = result.handbook
-            self.handbook_path = result.handbook_path
-            self.quick = result.quick
-            self.quick_path = result.quick_path
-            self.transcript_text = "\n\n".join(
-                t.to_markdown() for t in result.transcripts
-            )
-            self.transcript_path = result.transcript_path
-            bus.publish(
-                {
-                    "type": "run_done",
-                    "job": "run",
-                    "handbook": str(result.handbook_path),
-                    "quick": str(result.quick_path) if result.quick_path else "",
-                    "transcript": str(result.transcript_path),
-                }
+            self.result = result
+            self._emit(
+                "run_done",
+                handbook=str(result.handbook_path),
+                quick=str(result.quick_path) if result.quick_path else "",
+                transcript=str(result.transcript_path),
             )
         except pipeline.RunStopped:
-            bus.publish(
-                {
-                    "type": "notice",
-                    "job": "run",
-                    "kind": "final",
-                    "text": "已停止。本轮作废，没有写出任何文件。",
-                }
+            self._emit(
+                "notice",
+                kind="final",
+                text="已停止。本轮作废，没有写出任何文件。",
             )
         except MissingApiKey as exc:
             self._fail(str(exc).strip(), full=False)
         except Exception as exc:  # noqa: BLE001
             self._fail(str(exc).strip())
         finally:
-            try:
-                bus.publish({"type": "done", "job": "run"})
-            finally:
-                self.finished.set()
-
-    def _fail(self, text: str, *, full: bool = True) -> None:
-        print(f"\n[运行失败]\n{text}\n", file=sys.stderr, flush=True)
-        if full:
-            first = text.splitlines()[0] if text else "未知错误"
-            if len(first) > 300:
-                first = first[:300] + "…"
-            text = f"{first}（完整信息见终端）"
-        self.bus.publish({"type": "notice", "job": "run", "kind": "warning", "text": text})
+            self._finish()
 
 
 # ---------------------------------------------------------------------------
@@ -533,17 +484,12 @@ def _blueprint_payload(bp: Blueprint, path: Optional[Path] = None) -> dict:
         "purpose": {"text": bp.purpose.text, "title": bp.purpose.title},
         "personas": [
             {
-                "name": bp.proposer.name,
-                "title": bp.proposer.title,
-                "stance": bp.proposer.stance,
-                "system_message": full_system_message(bp.proposer, challenger=False),
-            },
-            {
-                "name": bp.challenger.name,
-                "title": bp.challenger.title,
-                "stance": bp.challenger.stance,
-                "system_message": full_system_message(bp.challenger, challenger=True),
-            },
+                "name": p.name,
+                "title": p.title,
+                "stance": p.stance,
+                "system_message": full_system_message(p, challenger=(index == 1)),
+            }
+            for index, p in enumerate(bp.personas)
         ],
         "topics": [
             {
@@ -569,13 +515,14 @@ def _blueprint_payload(bp: Blueprint, path: Optional[Path] = None) -> dict:
 def _pick_doc(job: Optional[_RunJob], kind: str) -> tuple[str, Optional[Path]]:
     """取某一轮 run 的某一份产物。JSON 路由和 .md 下载共用它，
     免得「网页上看到的」和「下载到的」各写一份取数逻辑。"""
-    if job is None:
+    if job is None or job.result is None:
         return "", None
+    result = job.result
     if kind == "handbook":
-        return job.handbook, job.handbook_path
+        return result.handbook, result.handbook_path
     if kind == "quick":
-        return job.quick, job.quick_path
-    return job.transcript_text, job.transcript_path
+        return result.quick, result.quick_path
+    return result.transcript, result.transcript_path
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -632,7 +579,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(_build_page(self.server), "text/html; charset=utf-8")
         elif path == "/health":
             job = self.server.job
-            running = job is not None and not job.finished.is_set()
+            running = self.server.busy()
             self._json(
                 {
                     "app": _APP_ID,
@@ -732,7 +679,7 @@ class _Handler(BaseHTTPRequestHandler):
         mock = bool(body.get("mock"))
 
         with server._lock:
-            if server.job is not None and not server.job.finished.is_set():
+            if server.busy():
                 self._json({"ok": False, "why": "已经有一轮在跑了，等它结束。"})
                 return
             job = _ForgeJob(
@@ -776,7 +723,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         with server._lock:
-            if server.job is not None and not server.job.finished.is_set():
+            if server.busy():
                 self._json({"ok": False, "why": "已经有一轮在跑了，等它结束。"})
                 return
             bp = server.blueprint
@@ -857,6 +804,10 @@ class _Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
+    def busy(self) -> bool:
+        """当前是否有任务在跑。准入检查和 /health 共用同一个判定。"""
+        return self.job is not None and not self.job.finished.is_set()
+
     def __init__(
         self,
         addr,
@@ -874,7 +825,6 @@ class _Server(ThreadingHTTPServer):
         #: 最近一次 forge 出来的蓝图。两段之间唯一的交接点。
         self.blueprint: Optional[Blueprint] = None
         self.blueprint_path: Optional[Path] = None
-        self.blueprint_md_path: Optional[Path] = None
         #: 最近一次 run 的 job，下载路由从这里取正文。
         self.last_run: Optional[_RunJob] = None
         self.mock_default = mock_default
@@ -1418,18 +1368,14 @@ function notice(text, tone) {
   $("notice").className = tone || "";
   $("notice").textContent = text || "";
 }
+const LOCKED_WHILE_RUNNING = [
+  "forgeBtn", "purpose", "title", "topicCount", "forgeMock",
+  "runBtn", "rounds", "converge", "runMock",
+];
 function setRunning(on) {
   running = on;
-  $("forgeBtn").disabled = on;
-  $("purpose").disabled = on;
-  $("title").disabled = on;
-  $("topicCount").disabled = on;
-  $("forgeMock").disabled = on;
-  $("runBtn").disabled = on;
+  for (const id of LOCKED_WHILE_RUNNING) { $(id).disabled = on; }
   $("stopBtn").disabled = !on;
-  $("rounds").disabled = on;
-  $("converge").disabled = on;
-  $("runMock").disabled = on;
   $("topics").querySelectorAll("input").forEach((cb) => {
     cb.disabled = on || cb.dataset.fixed === "1";
   });
@@ -1843,13 +1789,11 @@ $("rounds").onchange = updateRunHint;
 
 // ---- Tab ----
 function pickTab(which) {
-  const chat = which === "chat", bpt = which === "bp", out = which === "out";
-  $("tab-chat").className = "tab" + (chat ? " on" : "");
-  $("tab-bp").className = "tab" + (bpt ? " on" : "");
-  $("tab-out").className = "tab" + (out ? " on" : "");
-  $("pane-chat").className = "pane" + (chat ? " on" : "");
-  $("pane-bp").className = "pane" + (bpt ? " on" : "");
-  $("pane-out").className = "pane" + (out ? " on" : "");
+  for (const w of ["chat", "bp", "out"]) {
+    const on = w === which;
+    $("#tab-" + w).className = "tab" + (on ? " on" : "");
+    $("#pane-" + w).className = "pane" + (on ? " on" : "");
+  }
 }
 $("tab-chat").onclick = () => pickTab("chat");
 $("tab-bp").onclick = () => pickTab("bp");
@@ -1858,6 +1802,7 @@ $("tab-out").onclick = () => pickTab("out");
 // 刷新页面时主动补一次状态：run 一开始 bus 就 reset 了，历史里不再有 forge_done；
 // 不主动拉 /blueprint 的话，审阅面板会凭空消失。
 async function restoreBlueprint() {
+  if (bp) { return; }  // SSE 重放或上一次渲染已经在了，不必再拉一遍
   try {
     const r = await (await fetch("/blueprint")).json();
     if (r.ready) { renderBlueprint(r); }
