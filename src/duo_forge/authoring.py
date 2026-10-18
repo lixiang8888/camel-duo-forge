@@ -47,8 +47,9 @@ from .personas import (
     Persona,
     PersonaPlan,
 )
-from .purpose import Purpose
+from .purpose import MAX_TITLE, Purpose
 from .topics import (
+    CLOSING_KEY,
     DEFAULT_TOPIC_COUNT,
     MAX_BRIEF,
     MAX_GOAL,
@@ -324,7 +325,7 @@ def _parse_personas(
         else _parse_persona(raw.get("challenger"), "第二位专家（challenger）")
     )
     return ForgedPersonas(
-        title=_field(raw, "title", "成果物标题", 60),
+        title=_field(raw, "title", "成果物标题", MAX_TITLE),
         slug=_slug(raw.get("slug"), "duo"),
         proposer=proposer,
         challenger=challenger,
@@ -339,9 +340,9 @@ def _plan_prompt_block(plan: PersonaPlan) -> str:
     他「是谁、负责什么」就够了。
     """
     lines: list[str] = []
-    for side, spec, label in (
-        ("proposer", plan.proposer, "第一位专家（proposer）"),
-        ("challenger", plan.challenger, "第二位专家（challenger）"),
+    for spec, label in (
+        (plan.proposer, "第一位专家（proposer）"),
+        (plan.challenger, "第二位专家（challenger）"),
     ):
         if spec.mode == "manual":
             lines.append(
@@ -366,7 +367,7 @@ def _parse_topics(raw: dict) -> tuple[Topic, ...]:
 
     topics: list[Topic] = []
     # 收尾议题的 key 是保留的，模型要是生成了一个同名的，这里给它让开
-    seen = {"closing"}
+    seen = {CLOSING_KEY}
     for index, item in enumerate(items, 1):
         if not isinstance(item, dict):
             raise AuthoringError(f"第 {index} 个议题不是 JSON 对象。")

@@ -82,6 +82,12 @@ def _load_persona_plan(path: Path | None) -> PersonaPlan:
     return parse_persona_plan(raw)
 
 
+def _fail(label: str, detail: object) -> int:
+    """统一把错误打到 stderr，并返回命令行的失败退出码。"""
+    print(f"\n[{label}] {detail}\n", file=sys.stderr)
+    return 2
+
+
 # ---------------------------------------------------------------------------
 # forge
 # ---------------------------------------------------------------------------
@@ -93,15 +99,13 @@ def _cmd_forge(args: argparse.Namespace) -> int:
     try:
         purpose = _purpose_from_args(args)
     except InvalidPurpose as exc:
-        print(f"\n[目的有问题] {exc}\n", file=sys.stderr)
-        return 2
+        return _fail("目的有问题", exc)
 
     # 人格文件在任何付费调用之前解析完：写错一个字不该先花掉一次模型调用。
     try:
         plan = _load_persona_plan(args.personas_file)
     except PersonaSpecError as exc:
-        print(f"\n[人格设定有问题] {exc}\n", file=sys.stderr)
-        return 2
+        return _fail("人格设定有问题", exc)
 
     print(f"目的：{purpose.summary()}")
     if plan.both_manual:
@@ -130,20 +134,16 @@ def _cmd_forge(args: argparse.Namespace) -> int:
             purpose, backend=author, topic_count=args.topics, plan=plan
         )
     except MissingApiKey as exc:
-        print(f"\n[配置缺失] {exc}\n", file=sys.stderr)
-        return 2
+        return _fail("配置缺失", exc)
     except authoring.AuthoringError as exc:
-        print(f"\n[生成失败] {exc}\n", file=sys.stderr)
-        return 2
+        return _fail("生成失败", exc)
 
     made = dataclasses.replace(made, origin="mock" if args.mock else "model")
     return _save_and_report(made, args.out)
 
 
 def _save_and_report(made: Blueprint, out_dir: Path) -> int:
-    json_path = made.save(out_dir)
-    md_path = json_path.with_suffix(".md")
-    md_path.write_text(made.to_markdown(), encoding="utf-8")
+    json_path, md_path = made.save_bundle(out_dir)
 
     print(f"\n标题：{made.title}（slug: {made.slug}）")
     print(
@@ -179,20 +179,17 @@ def _cmd_run(args: argparse.Namespace) -> int:
     from . import authoring  # 惰性 import：会拖进 camel（见模块开头）
 
     if args.blueprint and (args.purpose or args.purpose_file):
-        print(
-            "\n[参数冲突] --blueprint 和 --purpose 只能给一个："
-            "蓝图里已经存着目的了。\n",
-            file=sys.stderr,
+        return _fail(
+            "参数冲突",
+            "--blueprint 和 --purpose 只能给一个：蓝图里已经存着目的了。",
         )
-        return 2
 
     if args.blueprint and args.personas_file:
-        print(
-            "\n[参数冲突] 用 --blueprint 时人格已经存在，不能再给 --personas-file。"
-            "想改人格就直接改蓝图 JSON。\n",
-            file=sys.stderr,
+        return _fail(
+            "参数冲突",
+            "用 --blueprint 时人格已经存在，不能再给 --personas-file。"
+            "想改人格就直接改蓝图 JSON。",
         )
-        return 2
 
     try:
         if args.blueprint:
@@ -204,8 +201,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             try:
                 plan = _load_persona_plan(args.personas_file)
             except PersonaSpecError as exc:
-                print(f"\n[人格设定有问题] {exc}\n", file=sys.stderr)
-                return 2
+                return _fail("人格设定有问题", exc)
             print(f"目的：{purpose.summary()}")
             print(
                 "· 两位专家由你提供，正在设计议题……"
@@ -224,23 +220,19 @@ def _cmd_run(args: argparse.Namespace) -> int:
             saved = bp.save(args.out or BLUEPRINT_DIR)
             print(f"· 蓝图已存：{saved}")
     except MissingApiKey as exc:
-        print(f"\n[配置缺失] {exc}\n", file=sys.stderr)
-        return 2
+        return _fail("配置缺失", exc)
     except (InvalidPurpose, BlueprintError, authoring.AuthoringError) as exc:
-        print(f"\n[{type(exc).__name__}] {exc}\n", file=sys.stderr)
-        return 2
+        return _fail(type(exc).__name__, exc)
 
     try:
         topics = bp.select(args.only)
     except BlueprintError as exc:
-        print(f"\n[议题选择有问题] {exc}\n", file=sys.stderr)
-        return 2
+        return _fail("议题选择有问题", exc)
 
     try:
         backend = build_backend(mock=args.mock)
     except MissingApiKey as exc:
-        print(f"\n[配置缺失] {exc}\n", file=sys.stderr)
-        return 2
+        return _fail("配置缺失", exc)
 
     if args.mock:
         print("\n!! 模拟模式：不会调用真实模型，产出的是占位内容，没有参考价值。\n")
@@ -321,8 +313,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
     try:
         bp = blueprint_mod.load(args.blueprint)
     except BlueprintError as exc:
-        print(f"\n[蓝图有问题] {exc}\n", file=sys.stderr)
-        return 2
+        return _fail("蓝图有问题", exc)
     print(bp.to_json() if args.json else bp.to_markdown())
     return 0
 

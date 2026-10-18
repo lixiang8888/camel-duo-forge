@@ -185,6 +185,17 @@ class Blueprint:
         path.write_text(self.to_json(), encoding="utf-8")
         return path
 
+    def save_bundle(self, out_dir: Path, *, stamp: str = "") -> tuple[Path, Path]:
+        """JSON + 同名可读版一起落盘，返回两个路径。
+
+        CLI 和网页启动器都要这一对文件；规则只留这一份，免得一边写了 .md、
+        另一边忘了。
+        """
+        json_path = self.save(out_dir, stamp=stamp)
+        md_path = json_path.with_suffix(".md")
+        md_path.write_text(self.to_markdown(), encoding="utf-8")
+        return json_path, md_path
+
 
 def _fence_for(text: str) -> str:
     """生成一段比正文里最长反引号串更长（至少三个）的围栏。"""

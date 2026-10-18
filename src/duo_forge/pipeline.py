@@ -48,6 +48,9 @@ class RunResult:
     #: 这一轮就只交付完整版——比落一个空文件干净。
     quick_path: Optional[Path]
     quick: str
+    #: 对话实录的完整文本（和落盘的那份逐字相同）。launcher 直接取它，
+    #: 不必再按 `"\n\n".join(...)` 重新拼一遍。
+    transcript: str = ""
 
 
 @dataclass
@@ -117,6 +120,8 @@ def run_pipeline(
 
     transcripts: list["TopicTranscript"] = []
     sections: list[str] = []
+    #: 每个议题的对话文本。整理正文和收尾议题都要用，算一次就够。
+    dialogues: list[str] = []
     # 只有收尾议题会赋真值；先给个初值，免得议题表不以收尾结尾时
     # 末尾 assemble(sections, closing) 直接 NameError。
     closing = ""
@@ -149,15 +154,17 @@ def run_pipeline(
         if h.on_section_start:
             h.on_section_start(topic, is_final)
 
+        dialogue = transcript.as_dialogue()
+        dialogues.append(dialogue)
         if is_final:
             # 收尾议题要把前面所有议题的结论一起喂进去，否则写不出「分歧备忘」
-            context = "\n\n".join(t.as_dialogue() for t in transcripts)
+            context = "\n\n".join(dialogues)
             closing = digest.digest_closing(context, backend=backend, title=blueprint.title)
             produced = closing
         else:
             produced = digest.digest_section(
                 topic,
-                transcript.as_dialogue(),
+                dialogue,
                 backend=backend,
                 title=blueprint.title,
             )
@@ -208,9 +215,8 @@ def run_pipeline(
     if h.on_quick_done:
         h.on_quick_done(quick)
 
-    transcript_path.write_text(
-        "\n\n".join(t.to_markdown() for t in transcripts), encoding="utf-8"
-    )
+    transcript_text = "\n\n".join(t.to_markdown() for t in transcripts)
+    transcript_path.write_text(transcript_text, encoding="utf-8")
     handbook_path.write_text(handbook, encoding="utf-8")
     if quick_path:
         quick_path.write_text(quick, encoding="utf-8")
@@ -225,6 +231,7 @@ def run_pipeline(
         closing=closing,
         quick_path=quick_path,
         quick=quick,
+        transcript=transcript_text,
     )
     if h.on_run_done:
         h.on_run_done(result)
