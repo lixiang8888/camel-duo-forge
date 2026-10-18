@@ -1,6 +1,7 @@
 # 工程手册
 
-面向要读代码、改代码的人。项目是什么、怎么跑起来，见 [README](../README.md)。
+面向要读代码、改代码的人。项目是什么、怎么跑起来，见 [README](../README.md)；
+怎么用见 [使用手册](USER_GUIDE.md)。
 
 - [一、两段流程](#一两段流程)
 - [二、和 camel-fitness-nutrition-duo 的对应关系](#二和-camel-fitness-nutrition-duo-的对应关系)
