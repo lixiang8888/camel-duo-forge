@@ -80,7 +80,12 @@ def live_server(tmp_path):
         out_dir=tmp_path / "outputs",
     )
     port = server.server_address[1]
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    # 默认 poll_interval 是 0.5s，shutdown() 每个测试都要等它醒来；降到 50ms。
+    thread = threading.Thread(
+        target=server.serve_forever,
+        kwargs={"poll_interval": 0.05},
+        daemon=True,
+    )
     thread.start()
     try:
         yield server, port
