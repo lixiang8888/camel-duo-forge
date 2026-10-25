@@ -36,7 +36,7 @@ import sys
 SHORTCUT_NAME = "智能体人格与议题生成器.lnk"
 
 #: 快捷方式的描述（鼠标悬停时显示）。
-DESCRIPTION = "按目的生成两位对谈专家的人格与议题，再让他们谈出成果"
+DESCRIPTION = "按目的生成 2–5 位对谈专家的人格与议题，再让他们谈出成果"
 
 
 def is_wsl() -> bool:
