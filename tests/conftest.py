@@ -37,12 +37,28 @@ def personas() -> tuple[Persona, Persona]:
             title="三甲医院康复科物理治疗师",
             stance="什么是对的",
             system_message="【人格】\n只认证据和量化的角度。\n\n【专业立场】\n先评估再干预。\n\n【你的盲区，不要掩饰】\n方案偏理想，不太管工位条件。",
+            role="主提出方",
         ),
         Persona(
             name="老张",
             title="带过两百个程序员的健身教练",
             stance="他到底做不做得到",
             system_message="【人格】\n务实、接地气。\n\n【专业立场】\n能坚持的六十分胜过两周的一百分。\n\n【你的盲区，不要掩饰】\n容易为了做得到而放松标准。",
+            role="挑战者",
+        ),
+    )
+
+
+@pytest.fixture
+def personas3(personas) -> tuple[Persona, ...]:
+    """三人模式：第 1 位主提出方，后两位是不同视角的回应者。"""
+    return personas + (
+        Persona(
+            name="算账方",
+            title="成本与风险顾问",
+            stance="代价划不划算",
+            system_message="【人格】\n先算代价再谈方案。\n\n【专业立场】\n任何建议都要标出时间和金钱成本。\n\n【你的盲区，不要掩饰】\n容易只盯成本而忽略收益。",
+            role="成本把关人",
         ),
     )
 
@@ -74,6 +90,18 @@ def blueprint(purpose, personas, topics) -> Blueprint:
         title=purpose.title,
         slug="neck-care",
         personas=personas,
+        topics=topics,
+        origin="test",
+    )
+
+
+@pytest.fixture
+def blueprint3(purpose, personas3, topics) -> Blueprint:
+    return Blueprint(
+        purpose=purpose,
+        title=purpose.title,
+        slug="neck-care-team",
+        personas=personas3,
         topics=topics,
         origin="test",
     )
