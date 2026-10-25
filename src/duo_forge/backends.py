@@ -19,6 +19,7 @@ camel 默认的 token 计数器要联网下载 tiktoken 词表，在国内会无
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, List, Optional, Type
 
 from camel.models import BaseModelBackend
@@ -139,6 +140,7 @@ _MOCK_PERSONAS = {
     "title": "模拟目的对谈手册",
     "slug": "mock-purpose",
     "proposer": {
+        "role": "方案提出方",
         "name": "方案方",
         "title": "模拟方案提出者",
         "stance": "什么是对的",
@@ -150,6 +152,7 @@ _MOCK_PERSONAS = {
         ),
     },
     "challenger": {
+        "role": "挑战者",
         "name": "挑刺方",
         "title": "模拟方案质疑者",
         "stance": "现实中做不做得到",
@@ -161,6 +164,71 @@ _MOCK_PERSONAS = {
         ),
     },
 }
+
+#: 多人模拟用的角色骨架。按人数截取，保证 role / name 都不重名。
+_MOCK_TEAM_ROLES = (
+    ("主提出方", "方案方", "模拟方案提出者", "什么是对的"),
+    ("挑战者", "挑刺方", "模拟方案质疑者", "现实中做不做得到"),
+    ("成本把关人", "算账方", "模拟成本与风险审核者", "代价划不划算"),
+    ("一线执行者", "执行方", "模拟一线执行者", "现场做不做得到"),
+    ("受益方代表", "受益方", "模拟受益方代表", "对使用者有什么影响"),
+)
+
+
+_MOCK_DISTILLED = {
+    "title": "模拟材料对谈手册",
+    "distilled_purpose": (
+        "这是离线模拟模式下从拖入材料提炼出的目的，不含任何真实内容，"
+        "只用来验证「材料 → 目的 → 蓝图」这条链路是不是通的。"
+    ),
+}
+
+
+def _mock_skeleton(people: int) -> list[dict]:
+    return [
+        {"role": role, "name": name, "title": title, "stance": stance}
+        for role, name, title, stance in _MOCK_TEAM_ROLES[:people]
+    ]
+
+
+def _mock_team_personas(people: int) -> dict:
+    personas = []
+    for index, (role, name, title, stance) in enumerate(
+        _MOCK_TEAM_ROLES[:people], 1
+    ):
+        position = (
+            "你是主提出方：先给出可执行方案，再听其他人的质疑。"
+            if index == 1
+            else "你是回应者：负责质疑、补充，或者指出方案落不了地的地方。"
+        )
+        personas.append(
+            {
+                "role": role,
+                "name": name,
+                "title": title,
+                "stance": stance,
+                "system_message": (
+                    f"【人格】\n这是离线模拟模式下生成的第 {index} 位参与者，"
+                    "不含任何真实内容，只用来验证解析链路是不是通的。\n\n"
+                    f"【专业立场】\n{position}\n\n"
+                    "【你的盲区，不要掩饰】\n模拟盲区：容易只从自己的分工看问题。"
+                ),
+            }
+        )
+    return {
+        "title": "模拟多人对谈手册",
+        "slug": "mock-team",
+        "personas": personas,
+    }
+
+
+def _requested_people(text: str) -> int:
+    """从提示词里的「人数：N 位」读人数。读不到就按两人处理。"""
+    match = re.search(r"人数[：:]\s*(\d+)", text)
+    if not match:
+        return 2
+    return max(2, min(5, int(match.group(1))))
+
 
 _MOCK_TOPICS = {
     "topics": [
@@ -189,11 +257,13 @@ _MOCK_TOPICS = {
 
 
 class ScriptedAuthorBackend(ScriptedBackend):
-    """给「生成人格 / 生成议题」用的假后端：吐的是**合法 JSON**。
+    """给「生成人格 / 议题」用的假后端：吐的是**合法 JSON**。
 
-    它靠提示词里出现的 schema 键名分辨这次要的是哪一份（`"proposer"` 还是
-    `"topics"`）。这不是什么优雅的协议，但胜在**不用往真实提示词里塞暗号**
-    ——那些键名本来就在提示词的 schema 里写着，真实模型看到的提示词一个字没变。
+    它靠提示词里出现的 schema 键名分辨这次要的是哪一份（`"proposer"`、
+    `"team"`、`"personas"` 还是 `"topics"`）。这不是什么优雅的协议，但胜在
+    **不用往真实提示词里塞暗号**——那些键名本来就在提示词的 schema 里写着，
+    真实模型看到的提示词一个字没变。多人模式的人数从提示词里的「人数：N 位」
+    读出来，也不用额外加标记。
 
     存在的意义：让 `authoring` 的「解析 → 校验 → 建 dataclass」这条链路
     在离线状态下也真的被走一遍。mock 若直接把内容硬编码成 dataclass，
@@ -205,10 +275,21 @@ class ScriptedAuthorBackend(ScriptedBackend):
         text = " ".join(
             str(m.get("content", "")) for m in messages if isinstance(m, dict)
         )
-        if '"proposer"' in text:
-            payload: dict = _MOCK_PERSONAS
+        people = _requested_people(text)
+        if '"distilled_purpose"' in text:
+            # 网页拖入材料后的「提炼目的」请求。
+            payload: dict = _MOCK_DISTILLED
+        elif '"proposer"' in text:
+            # 两人模式：保持原来的 proposer / challenger schema。
+            payload = _MOCK_PERSONAS
         elif '"topics"' in text:
             payload = _MOCK_TOPICS
+        elif '"personas"' in text:
+            # 多人模式的展开请求。这一步的提示词里既有 "personas" 也有骨架里的
+            # "team"，所以必须排在骨架判断前面。
+            payload = _mock_team_personas(people)
+        elif '"team"' in text:
+            payload = {"team": _mock_skeleton(people)}
         else:
             # 走到这里说明 authoring 的提示词模板被改得认不出来了。
             # 直接回一段非 JSON，让 authoring 抛出「解析失败」而不是悄悄产出一份假蓝图。
