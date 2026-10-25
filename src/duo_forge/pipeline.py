@@ -1,4 +1,4 @@
-"""完整流程的编排：对谈 → 整理 → 出成果 → 再压出一页速查。
+"""完整流程的编排：对谈 → 整理 → （仍有分歧就）最终统一 → 出成果 → 再压出一页速查。
 
 搬运自 camel-fitness-nutrition-duo 的 pipeline.py。它本来就把「跑什么」和
 「怎么展示」分开了，所以泛化得很轻：标题、专家、议题全部改从蓝图里取，
@@ -21,10 +21,10 @@ from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 from .blueprint import Blueprint
 from .config import OUTPUT_DIR
-from .topics import Topic, is_closing
+from .topics import Topic, convergence_topic, is_closing
 
 if TYPE_CHECKING:  # 只为类型标注，运行时不导入（避免拖进 camel）
-    from .society import TopicTranscript, Turn
+    from .society import ConvergenceResult, TopicTranscript, Turn
 
 
 class RunStopped(RuntimeError):
@@ -51,6 +51,9 @@ class RunResult:
     #: 对话实录的完整文本（和落盘的那份逐字相同）。launcher 直接取它，
     #: 不必再按 `"\n\n".join(...)` 重新拼一遍。
     transcript: str = ""
+    #: 全部议题结束后，成果里仍有分歧时跑的那一轮「最终统一意见」（附录 D）。
+    #: 没跑统一轮、或统一轮没有产出时是空串。
+    convergence: str = ""
 
 
 @dataclass
@@ -78,6 +81,10 @@ class PipelineHooks:
     on_quick_start: Optional[Callable[[], None]] = None
     # (速查版的 markdown；没产出就是空串)
     on_quick_done: Optional[Callable[[str], None]] = None
+    # () —— 全部议题结束、整理结果里仍标着分歧，开始最后一轮强制统一。
+    on_unify_start: Optional[Callable[[], None]] = None
+    # (统一轮的结果)。逐条发言仍然走 `on_turn`，topic.key 是 convergence。
+    on_unify_done: Optional[Callable[["ConvergenceResult"], None]] = None
     # (最终结果)
     on_run_done: Optional[Callable[[RunResult], None]] = None
 
@@ -96,17 +103,23 @@ def run_pipeline(
 ) -> RunResult:
     """跑完整流程。产物全部跑完才落盘，中途抛异常或喊停都不留半成品。
 
-    `should_stop` 的检查点只有两处：议题开始前、某个议题对谈结束后。
+    `should_stop` 的检查点只有三处：议题开始前、某个议题对谈结束后、统一轮前后。
     所以喊停最坏要等当前这一轮对谈跑完（society.step() 内部是两次模型调用，
     没法从中间掐断）。
 
-    `converge` 决定「所有回应者都没有新的反对意见就提前收手」要不要开（`rounds` 因此
-    是上限而非定额）。**mock 模式下恒关**，两个原因：ScriptedBackend 只吐固定
-    模板、根本不会说那句话，开着也只是白费判断；更重要的是 mock 的职责就是
-    证明「循环确实跑满了 N 轮」，让它在轮数上变来变去会让那条保证失效。
+    `converge` 决定两件收敛的事开不开：
 
-    所以本模块是**唯一**把「mock」翻译成「关掉收手」的地方：society 只认
-    `early_stop` 这个语义参数，它不认识 mock，也不该认识。
+    1. 每个议题里「所有回应者都没有新的反对意见就提前收手」（`rounds` 因此是
+       上限而非定额）；
+    2. 全部议题结束后，整理结果里还标着分歧时，再跑**一轮**最终统一意见
+       （固定一轮，不追加）。
+
+    **mock 模式下两件都恒关**：ScriptedBackend 只吐固定模板、不会说
+    「【无异议】」，也不会写分歧标记；更重要的是 mock 的职责就是证明「循环确实
+    跑满了 N 轮」，让它在轮数上变来变去会让那条保证失效。
+
+    所以本模块是**唯一**把「mock」翻译成「关掉收敛」的地方：society 只认
+    `early_stop` / `converge_history` 这些语义参数，它不认识 mock，也不该认识。
     """
     # 懒 import：这个模块会拖进 camel，而 `show --blueprint` 那条路不该为它付钱。
     from . import digest, society
@@ -125,6 +138,8 @@ def run_pipeline(
     # 只有收尾议题会赋真值；先给个初值，免得议题表不以收尾结尾时
     # 末尾 assemble(sections, closing) 直接 NameError。
     closing = ""
+    #: 任何一节或收尾附录标着「有分歧」，全部议题结束后就要补一轮统一。
+    has_unresolved = False
 
     for index, topic in enumerate(topics, 1):
         if should_stop and should_stop():
@@ -159,8 +174,9 @@ def run_pipeline(
         if is_final:
             # 收尾议题要把前面所有议题的结论一起喂进去，否则写不出「分歧备忘」
             context = "\n\n".join(dialogues)
-            closing = digest.digest_closing(context, backend=backend, title=blueprint.title)
-            produced = closing
+            produced = digest.digest_closing(
+                context, backend=backend, title=blueprint.title
+            )
         else:
             produced = digest.digest_section(
                 topic,
@@ -169,10 +185,44 @@ def run_pipeline(
                 title=blueprint.title,
                 people=len(blueprint.personas),
             )
+        # 标记是给代码看的：先判再摘，成品里不留。
+        has_unresolved = has_unresolved or digest.has_disagreement(produced)
+        produced = digest.strip_disagreement_markers(produced)
+        if is_final:
+            closing = produced
+        else:
             sections.append(produced)
 
         if h.on_section_done:
             h.on_section_done(topic, is_final, produced)
+
+    # ---- 最终统一轮：全部议题结束、成果里仍有分歧时，固定只补一轮 ----
+    convergence_result: Optional["ConvergenceResult"] = None
+    convergence_section = ""
+    if converge and not mock and has_unresolved:
+        if should_stop and should_stop():
+            raise RunStopped()
+        if h.on_unify_start:
+            h.on_unify_start()
+        conv_topic = convergence_topic()
+        context = digest.convergence_excerpt(
+            "\n\n".join([*sections, closing])
+        ) or "（没有可用的成果摘要。）"
+        convergence_result = society.converge_history(
+            personas=blueprint.personas,
+            backend=backend,
+            context=context,
+            on_turn=(
+                lambda t, _topic=conv_topic: h.on_turn(_topic, t)
+            ) if h.on_turn else None,
+        )
+        if should_stop and should_stop():
+            raise RunStopped()
+        convergence_section = digest.assemble_convergence(
+            convergence_result.unified, convergence_result.reservations
+        )
+        if h.on_unify_done:
+            h.on_unify_done(convergence_result)
 
     # ---- 落盘 ----
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -186,14 +236,18 @@ def run_pipeline(
     transcript_path = out / f"transcript-{stamp}{slug}{suffix}.md"
     handbook_path = out / f"handbook-{stamp}{slug}{suffix}.md"
 
-    head = digest.header(blueprint.title, blueprint.personas)
+    head = digest.header(
+        blueprint.title, blueprint.personas, unified=bool(convergence_section)
+    )
     if mock:
         head = (
             "> ⚠️ **这是模拟模式生成的占位文件，不含任何真实内容。**\n\n"
             + head
         )
 
-    handbook = digest.assemble(sections, closing, header=head)
+    handbook = digest.assemble(
+        sections, closing, header=head, convergence=convergence_section
+    )
 
     # 速查版在完整版之后生成，喂进去的就是上面这份拼好的全文——
     # 它因此不可能写出完整版里没有的东西，两份文件也不会互相矛盾。
@@ -204,7 +258,11 @@ def run_pipeline(
     quick_path: Optional[Path] = None
     if quick_body.strip():
         quick_path = out / f"quick-{stamp}{slug}{suffix}.md"
-        quick_head = digest.quick_header(blueprint.title, handbook_path.name)
+        quick_head = digest.quick_header(
+            blueprint.title,
+            handbook_path.name,
+            unified=bool(convergence_section),
+        )
         if mock:
             quick_head = (
                 "> ⚠️ **这是模拟模式生成的占位速查，不含任何真实内容。**\n\n"
@@ -214,7 +272,10 @@ def run_pipeline(
     if h.on_quick_done:
         h.on_quick_done(quick)
 
-    transcript_text = "\n\n".join(t.to_markdown() for t in transcripts)
+    transcript_parts = [t.to_markdown() for t in transcripts]
+    if convergence_result is not None:
+        transcript_parts.append(convergence_result.to_markdown())
+    transcript_text = "\n\n".join(transcript_parts)
     transcript_path.write_text(transcript_text, encoding="utf-8")
     handbook_path.write_text(handbook, encoding="utf-8")
     if quick_path:
@@ -231,6 +292,7 @@ def run_pipeline(
         quick_path=quick_path,
         quick=quick,
         transcript=transcript_text,
+        convergence=convergence_section,
     )
     if h.on_run_done:
         h.on_run_done(result)
