@@ -2,13 +2,19 @@
 
 两段流程之间唯一的接口就是这个文件。它存在的理由有两个：
 
-1. **钱**。`forge` 要花两次模型调用。议题不满意时，改这个 JSON 再跑就行，
+1. **钱**。`forge` 要花几次模型调用。议题不满意时，改这个 JSON 再跑就行，
    不用把人格和议题重新生成一遍。
-2. **可读**。它是给人看的——`to_markdown` 打出来的那份，把两位专家最终拿到的
+2. **可读**。它是给人看的——`to_markdown` 打出来的那份，把每位参与者最终拿到的
    system message 一字不差地摊开（包括由代码追加的发言纪律）。想确认「模型到底
    被要求了什么」，看这份，不用去猜提示词。
 
 刻意存成 JSON 而不是 pickle/自定义格式：它是要被人**动手改**的。
+
+## format 2 与旧文件
+
+format 2 的 `personas` 是 2–5 位的数组，每位多一个 `role`（AI 起的短角色名）。
+format 1 的旧蓝图仍然能读：它必须是两位，角色按位置补成「主提出方 / 挑战者」。
+人数不单独存字段，由 `len(personas)` 推导，避免两处不一致。
 """
 
 from __future__ import annotations
@@ -19,12 +25,22 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from .personas import Persona, full_system_message
+from .personas import (
+    MAX_ROLE,
+    MAX_PEOPLE,
+    MIN_PEOPLE,
+    Persona,
+    default_role,
+    full_system_message,
+)
 from .purpose import Purpose
 from .topics import CLOSING_KEY, Topic, closing_topic
 
-#: 蓝图文件的格式版本。将来字段变了，靠它认出旧文件并给人话提示。
-FORMAT = 1
+#: 蓝图文件的格式版本。format 2 起 personas 支持 2–5 位并带 role。
+FORMAT = 2
+
+#: 仍然能读的旧版本。读进来之后统一按 format 2 的 `Blueprint` 表示。
+LEGACY_FORMAT = 1
 
 
 class BlueprintError(RuntimeError):
@@ -36,20 +52,46 @@ class Blueprint:
     purpose: Purpose
     title: str
     slug: str
-    #: 恰好两位：方案提出方、挑战者。顺序有语义，不要调换。
-    personas: tuple[Persona, Persona]
+    #: 2–5 位。顺序有语义：第 1 位是主提出方（开场），其余是回应者。
+    personas: tuple[Persona, ...]
     #: 正文议题。收尾议题不在这里——它由 `all_topics()` 在末尾补上。
     topics: tuple[Topic, ...]
     #: "mock" / "model"，只用于展示。不参与任何判断。
     origin: str = ""
 
+    def __post_init__(self) -> None:
+        count = len(self.personas)
+        if not (MIN_PEOPLE <= count <= MAX_PEOPLE):
+            raise BlueprintError(
+                f"蓝图必须要有 {MIN_PEOPLE}–{MAX_PEOPLE} 位专家，收到 {count} 位。"
+            )
+        names = [p.name.strip() for p in self.personas]
+        if len(set(names)) != len(names):
+            raise BlueprintError(
+                "蓝图里有重名的专家："
+                + "、".join(sorted({n for n in names if names.count(n) > 1}))
+                + "。称呼必须唯一，否则发言记录分不清谁是谁。"
+            )
+        for index, persona in enumerate(self.personas, 1):
+            if persona.role and len(persona.role) > MAX_ROLE:
+                raise BlueprintError(
+                    f"第 {index} 位专家的角色名太长：上限 {MAX_ROLE} 字，"
+                    f"给了 {len(persona.role)} 字。"
+                )
+
     @property
     def proposer(self) -> Persona:
+        """第 1 位，结构上的主提出方。保留这个名字是为了少改老调用点。"""
         return self.personas[0]
 
     @property
     def challenger(self) -> Persona:
+        """第 2 位。两人模式下是挑战者；多人模式下只是第一位回应者。"""
         return self.personas[1]
+
+    @property
+    def people(self) -> int:
+        return len(self.personas)
 
     def closing(self) -> Topic:
         return closing_topic(len(self.topics), self.title)
@@ -90,6 +132,7 @@ class Blueprint:
             "purpose": {"text": self.purpose.text, "title": self.purpose.title},
             "personas": [
                 {
+                    "role": p.role,
                     "name": p.name,
                     "title": p.title,
                     "stance": p.stance,
@@ -113,7 +156,9 @@ class Blueprint:
         return json.dumps(self.to_dict(), ensure_ascii=False, indent=2) + "\n"
 
     def to_markdown(self) -> str:
-        """给人看的那份：两位专家的完整提示词 + 议题表。"""
+        """给人看的那份：全部参与者的完整提示词 + 议题表。"""
+        count = len(self.personas)
+        heading = "两位专家" if count == 2 else f"{count} 位专家"
         lines = [
             f"# 蓝图 · {self.title}",
             "",
@@ -124,24 +169,37 @@ class Blueprint:
             "",
             self.purpose.text.strip(),
             "",
-            "## 两位专家",
+            f"## {heading}",
             "",
-            "| | 方案提出方（先开口） | 挑战者（负责挑刺） |",
-            "|---|---|---|",
-            f"| 称呼 | {self.proposer.name} | {self.challenger.name} |",
-            f"| 身份 | {self.proposer.title} | {self.challenger.title} |",
-            f"| 负责 | {self.proposer.stance} | {self.challenger.stance} |",
+        ]
+        for index, persona in enumerate(self.personas, 1):
+            if index == 1:
+                position = "第 1 位 · 主提出方（开场）"
+            else:
+                position = f"第 {index} 位 · 回应者"
+            lines += [
+                f"- **{position}**：{persona.name}（{persona.title}），"
+                f"角色「{persona.role or '专家'}」，负责「{persona.stance}」"
+            ]
+        lines += [
             "",
-            "下面这两段，就是他们每一轮实际拿到的 system message 的前半部分"
+            "下面这几段，就是他们每一轮实际拿到的 system message 的前半部分"
             "（后面还会拼上【本次议题】和【本轮目标】）。",
             "",
         ]
-        for persona, challenger in ((self.proposer, False), (self.challenger, True)):
-            message = full_system_message(persona, challenger=challenger)
+        for index, persona in enumerate(self.personas, 1):
+            message = full_system_message(persona, opener=(index == 1))
             # 用户手写的人格可能自带代码围栏；固定三反引号会被它提前闭合。
             fence = _fence_for(message)
+            position = "主提出方" if index == 1 else f"第 {index} 位"
+            display = persona.role or persona.title
+            heading = (
+                f"### {persona.name}（{position}）"
+                if display == position
+                else f"### {persona.name} · {display}（{position}）"
+            )
             lines += [
-                f"### {persona.name} · {persona.title}",
+                heading,
                 "",
                 f"{fence}text",
                 message,
@@ -159,7 +217,7 @@ class Blueprint:
                 f"- **争的是哪一点**：{topic.brief}",
                 f"- **要收敛出什么**：{topic.goal}",
                 "",
-                "**开场发言**（方案提出方先开口）：",
+                "**开场发言**（第 1 位 · 主提出方先开口）：",
                 "",
                 *[f"> {line}" if line else ">" for line in topic.opening.splitlines()],
                 "",
@@ -172,7 +230,7 @@ class Blueprint:
         out_dir.mkdir(parents=True, exist_ok=True)
         stamp = stamp or datetime.now().strftime("%Y%m%d-%H%M%S")
         path = out_dir / f"{self.slug}-{stamp}.json"
-        # 两位人格都手写时 forge 只跑一次议题调用，连续两次很可能落在同一秒。
+        # 人格都手写时 forge 只跑一次议题调用，连续两次很可能落在同一秒。
         # 不覆盖别人刚写出来的蓝图。
         if path.exists():
             suffix = 2
@@ -221,9 +279,10 @@ def from_dict(raw: object, *, source: str = "蓝图") -> Blueprint:
         raise BlueprintError(f"{source} 的顶层必须是一个 JSON 对象。")
 
     version = raw.get("format", FORMAT)
-    if version != FORMAT:
+    if version not in (LEGACY_FORMAT, FORMAT):
         raise BlueprintError(
-            f"{source} 是格式版本 {version} 的蓝图，本程序只认 {FORMAT}。"
+            f"{source} 是格式版本 {version} 的蓝图，本程序只认 "
+            f"{LEGACY_FORMAT}（旧版）和 {FORMAT}。"
         )
 
     title = _text(raw, "title", source)
@@ -238,25 +297,38 @@ def from_dict(raw: object, *, source: str = "蓝图") -> Blueprint:
     )
 
     personas_raw = raw.get("personas")
-    if not isinstance(personas_raw, list) or len(personas_raw) != 2:
+    if not isinstance(personas_raw, list):
+        raise BlueprintError(f"{source} 里的 personas 必须是一个数组。")
+    if version == LEGACY_FORMAT and len(personas_raw) != 2:
         raise BlueprintError(
-            f"{source} 里的 personas 必须是恰好两位（方案提出方、挑战者）。"
+            f"{source} 是格式版本 1 的蓝图，personas 必须是恰好两位。"
         )
-    personas = tuple(_persona(item, source, i) for i, item in enumerate(personas_raw, 1))
+    if not (MIN_PEOPLE <= len(personas_raw) <= MAX_PEOPLE):
+        raise BlueprintError(
+            f"{source} 里的 personas 必须有 {MIN_PEOPLE}–{MAX_PEOPLE} 位，"
+            f"收到 {len(personas_raw)} 位。"
+        )
+    personas = tuple(
+        _persona(item, source, i, legacy=(version == LEGACY_FORMAT))
+        for i, item in enumerate(personas_raw, 1)
+    )
 
     topics_raw = raw.get("topics")
     if not isinstance(topics_raw, list) or not topics_raw:
         raise BlueprintError(f"{source} 里一个议题都没有。")
     topics = tuple(_topic(item, source, i) for i, item in enumerate(topics_raw, 1))
 
-    return Blueprint(
-        purpose=purpose,
-        title=title,
-        slug=slug,
-        personas=personas,  # type: ignore[arg-type]
-        topics=topics,
-        origin=str(raw.get("origin") or ""),
-    )
+    try:
+        return Blueprint(
+            purpose=purpose,
+            title=title,
+            slug=slug,
+            personas=personas,
+            topics=topics,
+            origin=str(raw.get("origin") or ""),
+        )
+    except BlueprintError as exc:
+        raise BlueprintError(f"{source}：{exc}") from None
 
 
 def _text(raw: dict, name: str, source: str, *, where: str = "") -> str:
@@ -267,14 +339,36 @@ def _text(raw: dict, name: str, source: str, *, where: str = "") -> str:
     return value.strip()
 
 
-def _persona(raw: object, source: str, index: int) -> Persona:
+def _optional_line(value: object, label: str, limit: int) -> str:
+    if value is None or value == "":
+        return ""
+    if not isinstance(value, str):
+        raise BlueprintError(f"{label}必须是一段文本。")
+    text = value.strip()
+    if "\n" in text or "\r" in text:
+        raise BlueprintError(f"{label}必须是单行。")
+    if len(text) > limit:
+        raise BlueprintError(
+            f"{label}太长：上限 {limit} 字，给了 {len(text)} 字。"
+        )
+    return text
+
+
+def _persona(
+    raw: object, source: str, index: int, *, legacy: bool = False
+) -> Persona:
     if not isinstance(raw, dict):
         raise BlueprintError(f"{source} 的第 {index} 位专家不是 JSON 对象。")
+    where = f"第 {index} 位专家"
+    role = _optional_line(raw.get("role"), f"{source} 的{where}角色名", MAX_ROLE)
+    if not role and legacy:
+        role = default_role(index, 2)
     return Persona(
-        name=_text(raw, "name", source, where=f"第 {index} 位专家"),
-        title=_text(raw, "title", source, where=f"第 {index} 位专家"),
-        stance=_text(raw, "stance", source, where=f"第 {index} 位专家"),
-        system_message=_text(raw, "system_message", source, where=f"第 {index} 位专家"),
+        name=_text(raw, "name", source, where=where),
+        title=_text(raw, "title", source, where=where),
+        stance=_text(raw, "stance", source, where=where),
+        system_message=_text(raw, "system_message", source, where=where),
+        role=role,
     )
 
 
