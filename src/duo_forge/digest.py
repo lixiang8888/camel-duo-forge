@@ -5,7 +5,7 @@
 的地方，换成调用方传进来的标题。
 
 注意：这一步**不是第三位智能体**。它没有独立人格，也不参与讨论，只是一个格式
-整理环节——把两位专家已经说过的话，压缩成能直接用的条文。观点全部来自对话本身，
+整理环节——把各位专家已经说过的话，压缩成能直接用的条文。观点全部来自对话本身，
 整理环节被明确要求不得添加新观点。
 
 这个约束在泛化之后**更要紧了**：目的可以是任何东西（睡眠、装修、面试准备），
@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+from typing import Sequence
+
 from camel.agents import ChatAgent
 
 from .personas import Persona
@@ -22,13 +24,13 @@ from .topics import Topic
 
 EDITOR_SYSTEM = """你是《{title}》的文字编辑。
 
-你唯一的工作是把两位专家的对话整理成读者可直接照做的条文。
+你唯一的工作是把各位专家的对话整理成读者可直接照做的条文。
 
 硬性要求：
 1. 只整理对话里已经出现过的内容。严禁添加任何新观点、新数据。
 2. 用「怎么做」的语气写，不要写成对话实录。
 3. 凡是出现数字的地方，必须保留原数字和单位。
-4. 两位专家有分歧的地方，必须如实并列写出双方立场，不要擅自调和。
+4. 专家们有分歧的地方，必须如实并列写出各方立场，不要擅自调和、也不要只挑两个人的说法。
 5. 直接输出 Markdown 正文，不要写「好的」「以下是」这类开场白。
 6. 如果对话里某一点说得不具体、无法执行，就不要写进这份文件。"""
 
@@ -40,7 +42,7 @@ SECTION_TEMPLATE = """议题：{title}
 本轮要收敛的结论：
 {goal}
 
-以下是两位专家围绕这个议题的完整对话：
+以下是各位专家围绕这个议题的完整对话：
 
 {dialogue}
 
@@ -58,16 +60,15 @@ SECTION_TEMPLATE = """议题：{title}
 ### 具体怎么做
 （分条展开，每条都要具体到读者今天就能照做）
 
-### 两人分歧
-（如实写出两位专家没有谈拢的地方，各自立场和理由。
- 如果确实完全一致，写「本议题双方无实质分歧」。）
+### {disagreement_heading}
+（如实写出各位专家没有谈拢的地方，各自立场和理由。
+ 如果确实完全一致，写「本议题各方无实质分歧」。）
 
 ### 注意
 （这一节里最容易做错、或者不适合哪些人的地方。没有就写「无」。）
-
 不要使用一级标题，不要重复输出议题名称之外的标题。"""
 
-CLOSING_TEMPLATE = """以下是两位专家在收尾讨论中的完整对话，以及他们此前各议题的结论摘要：
+CLOSING_TEMPLATE = """以下是各位专家在收尾讨论中的完整对话，以及他们此前各议题的结论摘要：
 
 {dialogue}
 
@@ -76,7 +77,8 @@ CLOSING_TEMPLATE = """以下是两位专家在收尾讨论中的完整对话，�
 请整理成本文件的附录，输出格式（严格遵守）：
 
 ## 附录 A · 分歧备忘
-（把整个过程里两人始终没有谈拢的点列出来。每条写：分歧点 / 方案方立场 / 挑战者立场 / 读者该怎么选。
+（把整个过程里各方始终没有谈拢的点列出来。每条写：分歧点 / 各方立场（逐位列明
+ 是哪位专家、什么理由）/ 读者该怎么选。
  这是这份文件最有价值的部分——如实呈现，不要和稀泥。）
 
 ## 附录 B · 红线信号
@@ -126,27 +128,45 @@ QUICK_TEMPLATE = """这是完整版的全文：
 （完整版里写明的「必须停下来去求助」的信号，最多 4 条。没有就写「无」。）
 
 不要使用一级标题。不要复述完整版的章节结构，
-不要写「两人分歧」这类只有完整版才需要的内容。"""
+不要写「各方分歧」这类只有完整版才需要的内容。"""
 
 
 def editor_system(title: str) -> str:
     return EDITOR_SYSTEM.format(title=title)
 
 
-def header(title: str, proposer: Persona, challenger: Persona) -> str:
+def header(title: str, personas: Sequence[Persona]) -> str:
     """成果文件开头的门面。
 
     由代码生成、不走模型：它是**说明这份文件是怎么来的**，不该由被说明的对象
     自己来写（模型写这段时几乎一定会开始加内容）。
     """
+    people = len(personas)
+    if people == 2:
+        first, second = personas
+        roster = f"""> 本文件由两个立场相反的智能体对谈产出：
+> **{first.name}**（{first.title}，角色「{first.display_role}」，负责「{first.stance}」）
+> ×
+> **{second.name}**（{second.title}，角色「{second.display_role}」，负责「{second.stance}」）。"""
+        closing = "所有结论都来自两人的分歧与妥协。"
+    else:
+        lines = [
+            f"> 本文件由 {people} 个立场与分工不同的智能体对谈产出："
+        ]
+        for index, persona in enumerate(personas, 1):
+            position = "主提出方" if index == 1 else "回应者"
+            lines.append(
+                f"> **{persona.name}**（{persona.title}，角色「"
+                f"{persona.display_role}」，负责「{persona.stance}」，{position}）"
+            )
+        roster = "\n".join(lines)
+        closing = f"所有结论都来自这 {people} 位专家的分歧与妥协。"
+
     return f"""# {title}
 
-> 本文件由两个立场相反的智能体对谈产出：
-> **{proposer.name}**（{proposer.title}，负责「{proposer.stance}」）
-> ×
-> **{challenger.name}**（{challenger.title}，负责「{challenger.stance}」）。
+{roster}
 >
-> 所有结论都来自两人的分歧与妥协。凡是他们没谈拢的地方，
+> {closing}凡是他们没谈拢的地方，
 > 附录 A 里原样保留，没有替你抹平。
 
 **怎么用**：先读第一节定基准，再挑对你有用的部分执行。
@@ -157,7 +177,7 @@ def quick_header(title: str, full_name: str) -> str:
     return f"""# {title} · 速查版
 
 > 这是从完整版 `{full_name}` 压缩出来的一页速查：只留最常用的部分，没有新增任何说法。
-> 分节展开的做法、两人始终没谈拢的地方（附录 A）、行动自检清单（附录 C）
+> 分节展开的做法、各方始终没谈拢的地方（附录 A）、行动自检清单（附录 C）
 > 都在完整版里，需要时再翻。"""
 
 
@@ -171,7 +191,7 @@ def footer() -> str:
     return """
 ---
 
-*本文件由 camel-duo-forge 生成：两位立场对立的 AI 专家围绕一个给定目的对谈，
+*本文件由 camel-duo-forge 生成：多位立场与分工不同的 AI 专家围绕一个给定目的对谈，
 再由编辑环节整理成文。内容仅供参考，不构成专业意见——涉及医疗、法律、财务
 这类专业问题时，请找相应的人，不要只看这里。*"""
 
@@ -183,12 +203,15 @@ def _generate(system: str, prompt: str, backend) -> str:
     return str(msgs[0].content).strip() if msgs else ""
 
 
-def digest_section(topic: Topic, dialogue: str, *, backend, title: str) -> str:
+def digest_section(
+    topic: Topic, dialogue: str, *, backend, title: str, people: int = 2
+) -> str:
     prompt = SECTION_TEMPLATE.format(
         title=topic.section_title,
         brief=topic.brief,
         goal=topic.goal,
         dialogue=dialogue,
+        disagreement_heading="两人分歧" if people == 2 else "各方分歧",
     )
     return _generate(editor_system(title), prompt, backend)
 
