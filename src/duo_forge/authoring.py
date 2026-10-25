@@ -1,11 +1,11 @@
-"""按目的生成两位专家的人格与议题。
+"""按目的生成 2–5 位参与者的人格与议题。
 
-这是新项目相对 camel-fitness-nutrition-duo 的**全部增量**。那边的人格和议题是
-手写死的（`personas.py` 里的营养师与教练、`topics.py` 里的五个健身议题），
-这里换成两次模型调用：
+两人模式保持原来的一次人格调用；三人及以上先让模型设计一份「团队分工骨架」，
+再把骨架一次性展开成完整人格。多出来的那一次调用换来的是角色互补性：
+五个人一次性现想，很容易出现几个换汤不换药的「专家」。
 
-    forge_personas(目的) → 两位立场对立的专家       （功能 1）
-    forge_topics(目的, 两位专家) → 一组议题         （功能 2）
+    forge_personas(目的, 人数) → N 位立场/分工不同的专家 + 标题
+    forge_topics(目的, N 位专家) → 一组议题
 
 ## 三个设计上的讲究
 
@@ -17,15 +17,15 @@
 「好的，以下是」，所以 `_extract_json` 会自己去文本里找那个 JSON 对象；
 但字段本身一个字都不放过——缺字段、类型不对、超长，全部当场报错并说清是哪一项。
 
-**三、分歧轴是选题的第一标准。** 两个人格必须**真的会吵**，议题必须是他们
+**三、分歧轴是选题的第一标准。** 参与者必须**真的会吵**，议题必须是他们
 **天然意见不一致**的具体问题。这是整个项目产出有没有信息量的唯一来源：
-两位互相附和，成果就是一锅正确的废话。所以两处提示词里这条都写在最前面。
+大家互相附和，成果就是一锅正确的废话。所以两处提示词里这条都写在最前面。
 
 ## 一个刻意的不对称
 
 人格里的**发言纪律不归模型写**（见 `personas.py` 开头）：模型只写
 【人格】【专业立场】【你的盲区】三块，纪律由代码追加。因为其中一条
-（挑战者「没有新的反对意见时只回【无异议】」）是 `society` 提前收手的硬契约，
+（回应者「没有新的反对意见时只回【无异议】」）是 `society` 提前收手的硬契约，
 模型漏写一次不会有任何报错，只会让每个议题都闷头跑满轮数。
 """
 
@@ -42,12 +42,14 @@ from .personas import (
     DISCIPLINE_MARKERS,
     MAX_NAME,
     MAX_PERSONA_TITLE,
+    MAX_ROLE,
     MAX_STANCE,
     MAX_SYSTEM_MESSAGE,
     Persona,
     PersonaPlan,
+    default_role,
 )
-from .purpose import MAX_TITLE, Purpose
+from .purpose import MAX_MATERIAL, MAX_PURPOSE, MAX_TITLE, MIN_PURPOSE, Purpose
 from .topics import (
     CLOSING_KEY,
     DEFAULT_TOPIC_COUNT,
@@ -67,6 +69,7 @@ __all__ = [
     "DEFAULT_TOPIC_COUNT",
     "ForgedPersonas",
     "assemble_blueprint",
+    "distill_material",
     "forge",
     "forge_personas",
     "forge_topics",
@@ -101,7 +104,9 @@ PERSONA_SYSTEM = """你是「对谈智能体人格设计师」。用户会给你
    盲区写出来，对方戳到它时才接得住，而不是绕开。
 4. 第一位（proposer）是**提出方案的人**：负责给出可执行的做法，会被对方挑刺。
    第二位（challenger）是**挑刺的人**：负责指出方案落不了地的地方，他的任务是质疑不是附和。
-5. 全程中文。
+5. `role` 是这位专家的短角色名（2–8 字），例如「循证营养师」「成本把关人」。
+   两人必须是不同的角色，不要都写「专家」。
+6. 全程中文。
 
 【不要写发言纪律】——「每轮多少字」「不许自称 AI」「什么时候可以收手」这些
 由系统统一追加，你写了会重复。你**只**写这三块：
@@ -116,12 +121,13 @@ PERSONA_SYSTEM = """你是「对谈智能体人格设计师」。用户会给你
   "title": "成果物的标题，6–14 字，像个书名，例如「健身饮食实战手册」",
   "slug": "标题的英文短标识，小写字母加连字符，例如 fitness-nutrition",
   "proposer": {
+    "role": "短角色名，例如「循证营养师」",
     "name": "两三个字的称呼，例如「营养师」",
     "title": "完整身份，例如「循证运动营养师」",
     "stance": "一句话说明他负责什么，例如「什么是对的」",
     "system_message": "他的完整人格设定，含【人格】【专业立场】【你的盲区，不要掩饰】三块，400 字以内"
   },
-  "challenger": { 同上，四个字段一模一样 }
+  "challenger": { 同上，五个字段一模一样 }
 }"""
 
 PERSONA_PROMPT = """目的：
@@ -135,25 +141,147 @@ PERSONA_TITLE_HINT = """
 """
 
 
-TOPICS_SYSTEM = """你是「对谈议题设计师」。已经有一对立场对立的专家，以及他们要谈的目的。
+# ---------------------------------------------------------------------------
+# 网页拖入的材料：先提炼成一段目的
+# ---------------------------------------------------------------------------
+
+DISTILL_SYSTEM = """你是「目的提炼师」。用户会给你一份或多份 Markdown / 文本材料，
+内容可能是需求、笔记、文章、提纲、会议记录、代码说明，**不一定已经写成一段目的**。
+
+你的任务是从材料里提炼出一件可以拿去做多方对谈的事。
+
+要求：
+
+1. 只依据材料，不要添加材料里没有的事实、数字、人物或背景。
+2. 目的要写清：这份材料想解决什么问题、给谁用、希望得到什么形态的成果。
+   200–800 字，最多不超过 2000 字。不要写成「关于……的一切」这种空泛的话。
+3. 如果材料本身已经是一段目的，保留它的核心、约束和具体数字，不要改写成空话。
+4. 如果材料来自多个文件，找出它们共同指向的那个问题；不要把每个文件各写一句。
+5. 标题 6–14 字，像个书名。材料里已经有明确标题（例如第一行 `# ...`）时优先用它。
+6. 全程中文。
+7. 只输出一个 JSON 对象，不要写任何解释，不要用 ``` 包裹：
+
+{
+  "title": "6–14 字的成果标题",
+  "distilled_purpose": "200–800 字的目的，最多 2000 字"
+}"""
+
+DISTILL_PROMPT = """材料来自：{files}
+
+以下是材料全文：
+
+{material}
+
+---
+
+请提炼出成果标题和目的。只输出那个 JSON 对象。"""
+
+
+# ---------------------------------------------------------------------------
+# 三人及以上：先团队骨架，再一次性展开
+# ---------------------------------------------------------------------------
+
+TEAM_SKELETON_SYSTEM = """你是「对谈团队设计师」。用户会给你一个目的和人数，
+你要设计一个**分工互补、且至少有一对会真的争起来**的专家团队。
+
+设计要点：
+
+1. 第 1 位是**主提出方**：负责给出可执行的具体方案，后面所有人都会挑他的刺。
+   他的专业身份要撑得起这个方案。
+2. 其余每一位都要有**不同的关注点**，不能只是换一个称呼。常见的分工方向：
+   领域专家（什么是对的）、落地执行者（现实中做不做得到）、成本/风险把关人、
+   受益方代表（这件事对谁有什么影响）。你也可以按目的自己选更合适的轴。
+3. 团队里至少要有一位**主要挑战者**，他的任务是质疑而不是附和。
+   如果所有人都站在同一侧，这个团队就没有存在的意义。
+4. 每位都要有具体身份（职业、年资、服务对象），不要写「专家 A」「专业人士」。
+5. `role` 是每人 2–8 字的短角色名；全队不能重名。
+6. 全程中文。
+
+输出：只输出一个 JSON 对象，不要写任何解释，不要用 ``` 包裹。
+不要写完整人格，这里只定分工骨架。
+
+{
+  "team": [
+    {
+      "role": "短角色名，例如「主提出方」",
+      "name": "两三个字的称呼，例如「营养师」",
+      "title": "完整身份，例如「循证运动营养师」",
+      "stance": "一句话说明他负责什么，例如「什么是对的」"
+    }
+  ]
+}"""
+
+TEAM_SKELETON_PROMPT = """目的：
+
+{purpose}
+{title_hint}
+人数：{people} 位。{plan_block}
+
+请设计这 {people} 位专家的团队分工骨架。只输出那个 JSON 对象。"""
+
+TEAM_PERSONAS_SYSTEM = """你是「对谈智能体人格设计师」。已经有一份团队分工骨架，
+你要把它展开成每位专家的完整人格。
+
+硬性要求：
+
+1. 严格按骨架里的人数、顺序、角色、称呼、身份、负责什么来写，不要自行增删或调换。
+2. 第 1 位是主提出方：人格里要体现他负责提出可执行方案，会成为其他人的靶子。
+3. 第 2 位及以后是回应者：他们的任务是质疑、补充、指出落地问题，不是附和。
+4. 每人必须写清【你的盲区，不要掩饰】——这是对话有没有张力的关键。
+5. 每人的 `system_message` 只写【人格】【专业立场】【你的盲区，不要掩饰】三块，
+   400 字以内。**不要写发言纪律**——「每轮多少字」「不许自称 AI」「什么时候
+   可以收手」由系统统一追加，你写了会重复。
+6. 全程中文。
+
+输出：只输出一个 JSON 对象，不要写任何解释，不要用 ``` 包裹。
+
+{
+  "title": "成果物的标题，6–14 字，像个书名",
+  "slug": "标题的英文短标识，小写字母加连字符",
+  "personas": [
+    {
+      "role": "照抄骨架里的角色名",
+      "name": "照抄骨架里的称呼",
+      "title": "照抄骨架里的身份",
+      "stance": "照抄骨架里的负责什么",
+      "system_message": "完整人格，含【人格】【专业立场】【你的盲区，不要掩饰】三块，400 字以内"
+    }
+  ]
+}"""
+
+TEAM_PERSONAS_PROMPT = """目的：
+
+{purpose}
+
+人数：{people} 位。{plan_block}
+
+团队分工骨架：
+
+{skeleton}
+
+请把它展开成 {people} 位专家的完整人格。只输出那个 JSON 对象。"""
+
+
+TOPICS_SYSTEM = """你是「对谈议题设计师」。已经有一组立场和分工不同的专家，以及他们要谈的目的。
 你要设计出他们逐个谈过去的议题。
 
 一个议题 = 成果物的一节。选题标准只有一条，也是最要紧的一条：
 
-**如果两位专家对这个议题天然意见一致，就不该收进来。**
+**如果所有专家对这个议题天然意见一致，就不该收进来。**
 
 每个议题都要是一个他们会被迫表态的具体分歧点，而不是一个宽泛的话题：
 「关于睡眠的一切」不是议题，「周末补觉能不能抵消工作日的睡眠债」才是。
+至少要有一对专家会在这个议题上真的争起来。
 
 具体要求：
 
 1. 议题要覆盖这个目的真正要紧的方面，**从最基础、最该先定下来的排起**。
    彼此不要重叠，也不要出现「一个议题整个装进另一个议题里面」的情况。
 2. 具体到能被追问：带上限定条件、人群、场景或数量级。
-3. `opening` 是**第一位专家（proposer，提方案的那位）的开场发言**：
-   结论先行，摆出他的具体方案，并留出让对方挑刺的空间。
+3. `opening` 是**第 1 位专家（主提出方）的开场发言**：
+   结论先行，摆出他的具体方案，并留出让其他人挑刺的空间。
    250 字以内，要像人在说话，不要写成大纲。
-4. `brief` 是写进两人 system message 的议题描述，要说清「争的是哪一点」。
+4. `brief` 是写进所有人 system message 的议题描述，要说清「争的是哪一点」。
 5. `goal` 是这个议题谈完要收敛出什么。
 6. `key` 是英文短标识（小写字母、数字、连字符），用于在命令行里指代这个议题，
    例如 "sleep-debt"。每个 key 不能重复。
@@ -169,7 +297,7 @@ TOPICS_SYSTEM = """你是「对谈议题设计师」。已经有一对立场对�
       "section_title": "一、带序号的标题",
       "brief": "这个议题争的是哪一点",
       "goal": "谈完要收敛出什么",
-      "opening": "方案提出方的开场发言"
+      "opening": "第 1 位专家（主提出方）的开场发言"
     }
   ]
 }"""
@@ -178,10 +306,9 @@ TOPICS_PROMPT = """目的：
 
 {purpose}
 
-两位专家：
+参与对谈的专家（共 {people} 位，顺序即发言顺序）：
 
-- {a_name}（{a_title}）—— 负责「{a_stance}」，他的方案会被对方挑刺
-- {b_name}（{b_title}）—— 负责「{b_stance}」
+{personas}
 
 请设计 {count} 个议题，按他们对谈的先后顺序排列。只输出那个 JSON 对象。"""
 
@@ -265,12 +392,29 @@ def _field(raw: dict, name: str, label: str, limit: int) -> str:
     return value
 
 
+def _optional_field(raw: dict, name: str, label: str, limit: int) -> str:
+    value = raw.get(name)
+    if value in (None, ""):
+        return ""
+    if not isinstance(value, str):
+        raise AuthoringError(f"{label}必须是一段文本。（JSON 字段：{name}）")
+    value = value.strip()
+    if "\n" in value or "\r" in value:
+        raise AuthoringError(f"{label}必须是单行。（JSON 字段：{name}）")
+    if len(value) > limit:
+        raise AuthoringError(
+            f"{label}太长：上限 {limit} 字，模型给了 {len(value)} 字。"
+            f"（JSON 字段：{name}）"
+        )
+    return value
+
+
 def _slug(raw: Any, fallback: str) -> str:
     slug = _NON_SLUG.sub("-", str(raw or "").strip().lower()).strip("-")
     return slug[:40] or fallback
 
 
-def _parse_persona(raw: Any, label: str) -> Persona:
+def _parse_persona(raw: Any, label: str, *, index: int, people: int) -> Persona:
     if not isinstance(raw, dict):
         raise AuthoringError(f"{label}必须是一个 JSON 对象。")
     message = _field(
@@ -284,77 +428,219 @@ def _parse_persona(raw: Any, label: str) -> Persona:
                 f"{label}的人格设定里出现了「{marker}」。"
                 "发言纪律和收手纪律由系统追加，不要写进人格设定。"
             )
+    role = _optional_field(raw, "role", f"{label}的角色名", MAX_ROLE)
     return Persona(
         name=_field(raw, "name", f"{label}的称呼", MAX_NAME),
         title=_field(raw, "title", f"{label}的身份", MAX_PERSONA_TITLE),
         stance=_field(raw, "stance", f"{label}负责什么", MAX_STANCE),
         system_message=message,
+        role=role or default_role(index, people),
     )
+
+
+def _ensure_unique(personas: Sequence[Persona], *, field: str) -> None:
+    values = [getattr(p, field).strip() for p in personas]
+    duplicates = sorted({v for v in values if values.count(v) > 1 and v})
+    if duplicates:
+        label = "称呼" if field == "name" else "角色名"
+        raise AuthoringError(
+            f"有重复的{label}：{'、'.join(duplicates)}。"
+            f"每位参与者的{label}必须唯一，否则对话记录分不清谁是谁。"
+        )
 
 
 @dataclass(frozen=True)
 class ForgedPersonas:
-    """第一次调用的产物：标题 + 两位专家。"""
+    """人格生成的产物：标题 + N 位参与者。"""
 
     title: str
     slug: str
-    proposer: Persona
-    challenger: Persona
+    personas: tuple[Persona, ...]
 
     @property
-    def pair(self) -> tuple[Persona, Persona]:
-        return (self.proposer, self.challenger)
+    def pair(self) -> tuple[Persona, ...]:
+        """老名字。现在可能是 2–5 位，不再是固定的一对。"""
+        return self.personas
+
+    @property
+    def proposer(self) -> Persona:
+        return self.personas[0]
+
+    @property
+    def challenger(self) -> Persona:
+        return self.personas[1]
+
+    @property
+    def people(self) -> int:
+        return len(self.personas)
 
 
 def _parse_personas(
     raw: dict, *, plan: PersonaPlan | None = None
 ) -> ForgedPersonas:
-    """只解析模型需要生成的那几位；manual 侧直接取用户给的，不理会模型写了什么。
+    """两人模式：解析模型生成的 proposer / challenger。
 
+    只解析模型需要生成的那几位；manual 侧直接取用户给的，不理会模型写了什么。
     这样即使模型漏写/写坏了手写侧，也不会触发一次无意义的重试。
     """
-    plan = plan or PersonaPlan()
+    plan = plan or PersonaPlan(people=2)
+    if plan.people != 2:
+        raise AuthoringError("两人模式的解析器收到了不是两位的团队。")
+
     proposer = (
-        plan.proposer.to_persona()
-        if plan.proposer.mode == "manual"
-        else _parse_persona(raw.get("proposer"), "第一位专家（proposer）")
+        plan.specs[0].to_persona(1, 2)
+        if plan.specs[0].mode == "manual"
+        else _parse_persona(
+            raw.get("proposer"), "第一位专家（proposer）", index=1, people=2
+        )
     )
     challenger = (
-        plan.challenger.to_persona()
-        if plan.challenger.mode == "manual"
-        else _parse_persona(raw.get("challenger"), "第二位专家（challenger）")
+        plan.specs[1].to_persona(2, 2)
+        if plan.specs[1].mode == "manual"
+        else _parse_persona(
+            raw.get("challenger"), "第二位专家（challenger）", index=2, people=2
+        )
     )
+    personas = (proposer, challenger)
+    _ensure_unique(personas, field="name")
+    _ensure_unique(personas, field="role")
     return ForgedPersonas(
         title=_field(raw, "title", "成果物标题", MAX_TITLE),
         slug=_slug(raw.get("slug"), "duo"),
-        proposer=proposer,
-        challenger=challenger,
+        personas=personas,
+    )
+
+
+def _parse_skeleton(raw: dict, *, plan: PersonaPlan) -> list[dict]:
+    """解析团队分工骨架。manual 位置用用户给的摘要覆盖模型输出。"""
+    items = raw.get("team")
+    if not isinstance(items, list):
+        raise AuthoringError("`team` 缺失，或者不是一个数组。")
+    if len(items) != plan.people:
+        raise AuthoringError(
+            f"团队分工骨架应该有 {plan.people} 位，模型给了 {len(items)} 位。"
+        )
+
+    skeleton: list[dict] = []
+    for index, (spec, item) in enumerate(zip(plan.specs, items), 1):
+        label = f"第 {index} 位专家"
+        if spec.mode == "manual":
+            persona = spec.to_persona(index, plan.people)
+            skeleton.append(
+                {
+                    "role": persona.role,
+                    "name": persona.name,
+                    "title": persona.title,
+                    "stance": persona.stance,
+                }
+            )
+            continue
+        if not isinstance(item, dict):
+            raise AuthoringError(f"团队分工骨架的{label}不是 JSON 对象。")
+        skeleton.append(
+            {
+                "role": _field(item, "role", f"{label}的角色名", MAX_ROLE),
+                "name": _field(item, "name", f"{label}的称呼", MAX_NAME),
+                "title": _field(item, "title", f"{label}的身份", MAX_PERSONA_TITLE),
+                "stance": _field(item, "stance", f"{label}负责什么", MAX_STANCE),
+            }
+        )
+
+    _ensure_unique(
+        [
+            Persona(
+                name=item["name"],
+                title=item["title"],
+                stance=item["stance"],
+                system_message="",
+                role=item["role"],
+            )
+            for item in skeleton
+        ],
+        field="name",
+    )
+    _ensure_unique(
+        [
+            Persona(
+                name=item["name"],
+                title=item["title"],
+                stance=item["stance"],
+                system_message="",
+                role=item["role"],
+            )
+            for item in skeleton
+        ],
+        field="role",
+    )
+    return skeleton
+
+
+def _parse_team_personas(raw: dict, *, plan: PersonaPlan) -> ForgedPersonas:
+    """三人及以上：解析展开后的 personas 数组。"""
+    items = raw.get("personas")
+    if not isinstance(items, list):
+        raise AuthoringError("`personas` 缺失，或者不是一个数组。")
+    if len(items) != plan.people:
+        raise AuthoringError(
+            f"`personas` 应该有 {plan.people} 位，模型给了 {len(items)} 位。"
+        )
+
+    personas: list[Persona] = []
+    for index, (spec, item) in enumerate(zip(plan.specs, items), 1):
+        label = f"第 {index} 位专家"
+        if spec.mode == "manual":
+            personas.append(spec.to_persona(index, plan.people))
+            continue
+        personas.append(_parse_persona(item, label, index=index, people=plan.people))
+
+    _ensure_unique(personas, field="name")
+    _ensure_unique(personas, field="role")
+    return ForgedPersonas(
+        title=_field(raw, "title", "成果物标题", MAX_TITLE),
+        slug=_slug(raw.get("slug"), "team" if plan.people > 2 else "duo"),
+        personas=tuple(personas),
     )
 
 
 def _plan_prompt_block(plan: PersonaPlan) -> str:
-    """把用户的人格意图拼进人格提示词。
+    """把用户的人格意图和团队要求拼进提示词。
 
-    手写侧只给 `name/title/stance` 摘要——**不**注入完整 `system_message`。
+    手写侧只给 `role/name/title/stance` 摘要——**不**注入完整 `system_message`。
     那段可能有上万字，塞进这里既贵，也扩大提示词注入面；对方只要能看懂
     他「是谁、负责什么」就够了。
     """
     lines: list[str] = []
-    for spec, label in (
-        (plan.proposer, "第一位专家（proposer）"),
-        (plan.challenger, "第二位专家（challenger）"),
-    ):
+    for index, spec in enumerate(plan.specs, 1):
+        if plan.people == 2:
+            label = (
+                "第一位专家（proposer，主提出方）"
+                if index == 1
+                else "第二位专家（challenger，主要挑战者）"
+            )
+        else:
+            label = f"第 {index} 位专家"
         if spec.mode == "manual":
+            role = spec.role or default_role(index, plan.people)
             lines.append(
-                f"- {label}由用户指定，必须原样采用：称呼「{spec.name}」，"
-                f"身份「{spec.title}」，负责「{spec.stance}」。"
-                "你要设计的另一位必须与它形成真正的对立。"
+                f"- {label}由用户指定，必须原样采用：角色「{role}」，"
+                f"称呼「{spec.name}」，身份「{spec.title}」，负责「{spec.stance}」。"
             )
         elif spec.mode == "hint":
             lines.append(f"- {label}请按这个方向设计：{spec.hint}")
-    if not lines:
+
+    parts: list[str] = []
+    if plan.team_hint:
+        parts.append(
+            "【团队分工要求】\n"
+            f"{plan.team_hint}\n"
+            f"这是强偏好：人数固定为 {plan.people} 位。如果要求里的角色数与人数"
+            "对不上，请自行合并或补充，但要点名出现的角色尽量保留。"
+        )
+    if lines:
+        parts.append("【用户对人格的额外要求】\n" + "\n".join(lines))
+    if not parts:
         return ""
-    return "\n\n【用户对人格的额外要求】\n" + "\n".join(lines)
+    return "\n\n" + "\n\n".join(parts)
 
 
 def _parse_topics(raw: dict) -> tuple[Topic, ...]:
@@ -436,34 +722,108 @@ def _ask_json(
     raise AuthoringError(f"{what}生成失败：{last_error}")
 
 
+def _parse_distilled(raw: dict) -> Purpose:
+    title = _field(raw, "title", "提炼出的标题", MAX_TITLE)
+    if "\n" in title or "\r" in title:
+        raise AuthoringError("提炼出的标题必须是单行。")
+    text = _field(raw, "distilled_purpose", "提炼出的目的", MAX_PURPOSE)
+    if len(text) < MIN_PURPOSE:
+        raise AuthoringError(
+            f"提炼出的目的太短了（{len(text)} 字）：至少 {MIN_PURPOSE} 字，"
+            "要说清「给谁、解决什么、想要什么成果」。"
+        )
+    return Purpose(text=text, title=title)
+
+
+def distill_material(
+    material: str, *, backend, files: Sequence[str] = ()
+) -> Purpose:
+    """把网页拖入的材料提炼成一段目的。
+
+    这是多人/单人模式之外**额外的一次模型调用**：材料可能是一份长文档，
+    不适合直接塞进每个人的 system message，所以先压成一段 ≤2000 字的目的，
+    后面的 forge 仍然只认 Purpose。
+    """
+    if not isinstance(material, str):
+        raise AuthoringError("材料必须是文本。")
+    text = material.strip()
+    if not text:
+        raise AuthoringError("材料是空的。")
+    if len(text) > MAX_MATERIAL:
+        raise AuthoringError(
+            f"材料太长：上限 {MAX_MATERIAL} 字，收到 {len(text)} 字。"
+            "请先精简材料，或者拆成几次。"
+        )
+
+    names = "、".join(name for name in files if name) or "用户拖入的材料"
+    prompt = DISTILL_PROMPT.format(files=names, material=text)
+    agent = ChatAgent(system_message=DISTILL_SYSTEM, model=backend)
+    return _ask_json(agent, prompt, _parse_distilled, what="目的提炼")
+
+
 def forge_personas(
     purpose: Purpose, *, backend, plan: PersonaPlan | None = None
 ) -> ForgedPersonas:
-    """功能一：按目的生成两位立场对立的专家（外加大标题）。
+    """按目的生成 N 位参与者（外加大标题）。
 
-    `plan` 里标记为 `manual` 的侧不交给模型。两位都 manual 时**一次人格模型调用都
-    不发**：只返回 `purpose.title`（或「对谈成果」）当标题，议题仍由 `forge_topics`
-    生成。只改一位时仍要调用一次人格模型——它至少还得生成另一位和标题。
+    - 全部 manual：一次人格调用都不发；
+    - 两人：一次调用，提示词仍要求一位主提出方 + 一位主要挑战者；
+    - 三人及以上：先一次团队骨架，再一次展开全部人格。
+
+    `plan` 里标记为 `manual` 的位置不交给模型。
     """
     plan = plan or PersonaPlan()
-    if plan.both_manual:
+    if plan.all_manual:
         title = purpose.title or "对谈成果"
         return ForgedPersonas(
             title=title,
-            slug=_slug(title, "duo"),
-            proposer=plan.proposer.to_persona(),
-            challenger=plan.challenger.to_persona(),
+            slug=_slug(title, "team" if plan.people > 2 else "duo"),
+            personas=tuple(
+                spec.to_persona(index, plan.people)
+                for index, spec in enumerate(plan.specs, 1)
+            ),
         )
 
     hint = PERSONA_TITLE_HINT.format(title=purpose.title) if purpose.title else ""
-    prompt = PERSONA_PROMPT.format(purpose=purpose.text, title_hint=hint)
-    # 全 auto 时这里返回空串，提示词与改动前逐字一致。
-    prompt += _plan_prompt_block(plan)
-    agent = ChatAgent(system_message=PERSONA_SYSTEM, model=backend)
+    plan_block = _plan_prompt_block(plan)
+
+    if plan.people == 2:
+        prompt = PERSONA_PROMPT.format(purpose=purpose.text, title_hint=hint)
+        # 全 auto 且没有团队要求时这里是空串，提示词与改动前逐字一致。
+        prompt += plan_block
+        agent = ChatAgent(system_message=PERSONA_SYSTEM, model=backend)
+        return _ask_json(
+            agent,
+            prompt,
+            lambda raw: _parse_personas(raw, plan=plan),
+            what="人格",
+        )
+
+    skeleton_prompt = TEAM_SKELETON_PROMPT.format(
+        purpose=purpose.text,
+        title_hint=hint,
+        people=plan.people,
+        plan_block=plan_block,
+    )
+    skeleton_agent = ChatAgent(system_message=TEAM_SKELETON_SYSTEM, model=backend)
+    skeleton = _ask_json(
+        skeleton_agent,
+        skeleton_prompt,
+        lambda raw: _parse_skeleton(raw, plan=plan),
+        what="团队分工",
+    )
+
+    personas_prompt = TEAM_PERSONAS_PROMPT.format(
+        purpose=purpose.text,
+        people=plan.people,
+        plan_block=plan_block,
+        skeleton=json.dumps({"team": skeleton}, ensure_ascii=False, indent=2),
+    )
+    personas_agent = ChatAgent(system_message=TEAM_PERSONAS_SYSTEM, model=backend)
     return _ask_json(
-        agent,
-        prompt,
-        lambda raw: _parse_personas(raw, plan=plan),
+        personas_agent,
+        personas_prompt,
+        lambda raw: _parse_team_personas(raw, plan=plan),
         what="人格",
     )
 
@@ -475,20 +835,23 @@ def forge_topics(
     backend,
     count: int = DEFAULT_TOPIC_COUNT,
 ) -> tuple[Topic, ...]:
-    """功能二：按目的和这两位专家，生成一组他们会真的吵起来的议题。
+    """按目的和这组专家，生成一组他们会真的吵起来的议题。
 
     注意这里**只生成正文议题**，收尾议题由 `topics.closing_topic` 按代码造
     （它的输入是前面全部对话，形状和普通议题不一样，见那个函数的说明）。
     """
-    proposer, challenger = personas[0], personas[1]
+    people = len(personas)
+    lines = []
+    for index, persona in enumerate(personas, 1):
+        position = "主提出方，负责开场" if index == 1 else "回应者"
+        lines.append(
+            f"第 {index} 位（{position}）：{persona.name}（{persona.title}），"
+            f"角色「{persona.display_role}」，负责「{persona.stance}」"
+        )
     prompt = TOPICS_PROMPT.format(
         purpose=purpose.text,
-        a_name=proposer.name,
-        a_title=proposer.title,
-        a_stance=proposer.stance,
-        b_name=challenger.name,
-        b_title=challenger.title,
-        b_stance=challenger.stance,
+        people=people,
+        personas="\n".join(lines),
         count=count,
     )
     agent = ChatAgent(system_message=TOPICS_SYSTEM, model=backend)
@@ -513,7 +876,7 @@ def assemble_blueprint(
         purpose=purpose,
         title=purpose.title or forged.title,
         slug=forged.slug,
-        personas=forged.pair,
+        personas=forged.personas,
         topics=tuple(topics),
         origin=origin,
     )
@@ -526,13 +889,14 @@ def forge(
     topic_count: int = DEFAULT_TOPIC_COUNT,
     plan: PersonaPlan | None = None,
 ) -> "Blueprint":
-    """目的 → 蓝图（标题 + 两位专家 + 一组议题）。
+    """目的 → 蓝图（标题 + N 位参与者 + 一组议题）。
 
-    正常是两次模型调用；只改一位仍是两次（人格 + 议题）；两位都手写时只有一次
-    （议题）。返回值是 `blueprint.Blueprint`。
+    两人正常两次调用（人格 + 议题）；三人及以上三次（骨架 + 人格 + 议题）；
+    全部手写时只有一次（议题）。返回值是 `blueprint.Blueprint`。
     """
+    plan = plan or PersonaPlan()
     forged = forge_personas(purpose, backend=backend, plan=plan)
     topics = forge_topics(
-        purpose, forged.pair, backend=backend, count=topic_count
+        purpose, forged.personas, backend=backend, count=topic_count
     )
     return assemble_blueprint(purpose, forged, topics)
