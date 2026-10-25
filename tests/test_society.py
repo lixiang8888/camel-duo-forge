@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from duo_forge import digest, society
+from duo_forge import digest, personas, society
 from duo_forge.backends import ScriptedBackend
 
 
@@ -337,3 +337,181 @@ def test_roles_appear_in_the_transcript(blueprint3, backend):
     assert "算账方（成本把关人）" in dialogue
     assert "（主提出方）" in transcript.to_markdown()
 
+
+# ---------------------------------------------------------------------------
+# 全部议题结束后的最终统一轮
+# ---------------------------------------------------------------------------
+
+
+class RepliesBackend(ScriptedBackend):
+    """按顺序吐出预设回复，用来精确控制统一轮里谁说了什么。"""
+
+    def __init__(self, replies):
+        super().__init__()
+        self.replies = list(replies)
+
+    def _reply(self, messages):
+        self._calls += 1
+        return self.replies.pop(0) if self.replies else "[假后端] 补充"
+
+
+def test_converge_history_collects_conclusion_and_reservations(blueprint):
+    backend = RepliesBackend(
+        [
+            "我还有一点：成本没人算过。",
+            "统一结论：采纳成本条款，其余按原方案定稿。",
+        ]
+    )
+    result = society.converge_history(
+        personas=blueprint.personas, backend=backend, context="【最终成果摘要】"
+    )
+
+    # 回应者先说、主提出方最后给结论；固定只有这一轮。
+    assert [t.speaker for t in result.turns] == ["老张", "康复师"]
+    assert result.unified.startswith("统一结论")
+    assert result.reservations == (("老张", "我还有一点：成本没人算过。"),)
+    assert result.all_conceded is False
+    assert "老张" in result.to_markdown()
+
+
+def test_converge_history_records_full_agreement(blueprint):
+    backend = RepliesBackend(
+        [society.NO_MORE_OBJECTION, "统一结论：维持现有成果。"]
+    )
+    result = society.converge_history(
+        personas=blueprint.personas, backend=backend, context="【最终成果摘要】"
+    )
+
+    assert result.all_conceded is True
+    assert result.reservations == ()
+    assert "所有回应者都表示接受统一结论" in result.to_markdown()
+
+
+def test_converge_history_keeps_three_person_turn_order(blueprint3):
+    backend = RepliesBackend(
+        [
+            society.NO_MORE_OBJECTION,
+            "我保留：未成年提示的强度还不够。",
+            "统一结论：采纳未成年提示加强，其余不变。",
+        ]
+    )
+    result = society.converge_history(
+        personas=blueprint3.personas, backend=backend, context="【最终成果摘要】"
+    )
+
+    assert [t.speaker for t in result.turns] == ["老张", "算账方", "康复师"]
+    assert result.reservations == (("算账方", "我保留：未成年提示的强度还不够。"),)
+
+
+def test_a_responder_who_only_says_no_objection_is_not_a_reservation(blueprint):
+    backend = RepliesBackend(
+        [society.NO_MORE_OBJECTION, "统一结论：按原方案定稿。"]
+    )
+    result = society.converge_history(
+        personas=blueprint.personas, backend=backend, context="摘要"
+    )
+    assert "老张" not in dict(result.reservations)
+
+
+def test_a_vague_yes_is_still_recorded_as_a_reservation(blueprint):
+    """宁可把模糊话记成保留，也不能把真正的反对吞掉。"""
+    backend = RepliesBackend(
+        ["我基本同意，不过成本还是没人算。", "统一结论：定稿。"]
+    )
+    result = society.converge_history(
+        personas=blueprint.personas, backend=backend, context="摘要"
+    )
+    assert result.all_conceded is False
+    assert "成本" in dict(result.reservations)["老张"]
+
+
+def test_convergence_system_message_uses_the_unification_discipline(blueprint):
+    message = personas.build_convergence_system_message(blueprint.personas[1])
+    opener = personas.build_convergence_system_message(
+        blueprint.personas[0], opener=True
+    )
+
+    assert "【统一纪律】" in message
+    assert "【无异议】" in message
+    assert "你是回应者" in message
+    assert "你是主提出方" in opener
+    # 普通收手纪律说「还有意见就必须继续提」，和统一轮要的「只留最后一条」冲突。
+    assert "【收手纪律】" not in message
+    assert "【收手纪律】" not in opener
+
+
+# ---------------------------------------------------------------------------
+# 分歧标记与统一轮的整理
+# ---------------------------------------------------------------------------
+
+
+def test_disagreement_markers_are_detected_and_stripped():
+    text = "## 一节\n内容\n【本节分歧：有】\n"
+    assert digest.has_disagreement(text)
+
+    cleaned = digest.strip_disagreement_markers(text)
+    assert "【本节分歧：有】" not in cleaned
+    assert "内容" in cleaned
+
+    # 模型偶尔会用半角冒号；标记的语义不变，代码不该因此漏判。
+    half_width = "## 一节\n内容\n【未解决分歧:有】"
+    assert digest.has_disagreement(half_width)
+    assert "【未解决分歧:有】" not in digest.strip_disagreement_markers(half_width)
+
+
+def test_a_missing_marker_counts_as_no_disagreement():
+    """标记是格式契约；没写就按无分歧处理，不为格式错误多跑一轮全员调用。"""
+    assert digest.has_disagreement("## 一节\n内容") is False
+    assert digest.has_disagreement("## 一节\n【本节分歧：无】") is False
+
+
+def test_convergence_excerpt_keeps_points_disagreements_and_appendix_a():
+    handbook = """# 标题
+
+## 一、节
+
+### 要点
+- 要点甲
+- 要点乙
+
+### 具体怎么做
+- 这一大段统一轮不需要
+
+### 各方分歧
+- 分歧甲
+
+## 附录 A · 分歧备忘
+- 未解决甲
+
+## 附录 B · 红线信号
+- 红线甲
+"""
+    excerpt = digest.convergence_excerpt(handbook)
+
+    assert "## 一、节" in excerpt
+    assert "要点甲" in excerpt
+    assert "分歧甲" in excerpt
+    assert "未解决甲" in excerpt
+    assert "这一大段统一轮不需要" not in excerpt
+    assert "红线甲" not in excerpt
+
+
+def test_assemble_convergence_lists_reservations():
+    section = digest.assemble_convergence("统一结论甲", (("老张", "保留甲"),))
+
+    assert "## 附录 D · 最终统一意见" in section
+    assert "统一结论甲" in section
+    assert "**老张**：保留甲" in section
+
+
+def test_assemble_convergence_says_when_everyone_agreed():
+    section = digest.assemble_convergence("统一结论甲", ())
+    assert "所有回应者都明确表示接受统一结论" in section
+
+
+def test_header_mentions_appendix_d_only_when_it_exists(blueprint):
+    without = digest.header("标题", blueprint.personas)
+    with_d = digest.header("标题", blueprint.personas, unified=True)
+
+    assert "附录 D" not in without
+    assert "附录 D" in with_d
