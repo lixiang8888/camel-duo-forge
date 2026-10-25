@@ -24,6 +24,9 @@ MAX_OPENING = 1000
 #: 收尾议题的固定 key。society 的提前收手、pipeline 的分岔全靠它认人。
 CLOSING_KEY = "closing"
 
+#: 全部议题结束后的最终统一轮。它同样不是蓝图里的议题，只是一个占位，
+#: 好让统一轮复用 Topic / 回调 / 对话记录的接口。
+CONVERGENCE_KEY = "convergence"
 
 MAX_TOPICS = 12
 
@@ -75,3 +78,18 @@ def closing_topic(count: int, title: str = "") -> Topic:
 def is_closing(topic: Topic) -> bool:
     return topic.key == CLOSING_KEY
 
+
+def convergence_topic() -> Topic:
+    """全部议题结束后的最终统一轮。
+
+    它不由模型生成，也不进蓝图；存在的意义是让 `pipeline` 的 `on_turn` 回调
+    仍有一个 Topic 可传（启动器按 topic.key 给发言分组），而不是再发明一套
+    只给这一轮用的回调。
+    """
+    return Topic(
+        key=CONVERGENCE_KEY,
+        section_title="最终统一意见",
+        brief="全部议题已经谈完。这一轮只收敛仍未谈拢的地方。",
+        goal="回应者明确接受，或只留最后一条修正；主提出方给出最终统一结论。",
+        opening="",
+    )
