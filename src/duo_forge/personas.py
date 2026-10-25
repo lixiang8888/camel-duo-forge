@@ -60,9 +60,10 @@ MAX_TEAM_HINT = 500
 MIN_PEOPLE = 2
 MAX_PEOPLE = 5
 
-#: 这两段由 `full_system_message` 追加。用户手写或提示里出现会造成重复，
-#: 所以解析时直接拒绝。只匹配精确标记，不按「发言纪律」四个字宽泛拦截。
-DISCIPLINE_MARKERS = ("【发言纪律】", "【收手纪律】")
+#: 这几段由 `full_system_message` / `build_convergence_system_message` 追加。
+#: 用户手写或提示里出现会造成重复，所以解析时直接拒绝。只匹配精确标记，
+#: 不按「发言纪律」四个字宽泛拦截。
+DISCIPLINE_MARKERS = ("【发言纪律】", "【收手纪律】", "【统一纪律】")
 
 #: 自定义人格的三种模式。见 `PersonaSpec`。
 MODES = ("auto", "hint", "manual")
@@ -451,6 +452,44 @@ CONCESSION_CONTRACT = """【收手纪律】
 
 #: 旧名字。两人模式里回应者就是挑战者，留着它让老 import 继续成立。
 CHALLENGER_CONTRACT = CONCESSION_CONTRACT
+
+
+#: 全部议题结束后的最后统一轮专用。这一轮不是再吵一轮，而是收口：
+#: 回应者要么明确接受，要么只留最后一条修正；主提出方听完所有人后必须给出
+#: 统一结论。它也是机器契约——`society.converge_history` 只认「【无异议】」，
+#: 其余发言一律记作保留意见，所以由代码追加，不交给模型写。
+CONVERGENCE_CONTRACT = """【统一纪律】
+- 这是全部议题结束后的最后统一轮。最终成果的要点与分歧摘要已经发给你，
+  只处理仍未谈拢的地方，已经一致的内容不要重复。
+- 回应者：如果你接受最终成果，就只回复「【无异议】」，不要写别的；
+  如果还有保留，只提最后一条必须修正的地方，说清代价和替代做法。
+- 主提出方：听完所有回应后给出最终统一结论。明确写清：哪些按原方案定稿、
+  采纳了谁的哪条修正、谁仍保留什么意见。不要和稀泥，也不要把没谈拢说成谈拢了。
+- 每轮发言 250 字以内。"""
+
+
+def build_convergence_system_message(
+    persona: Persona, *, opener: bool = False
+) -> str:
+    """最终统一轮的 system message。
+
+    和 `full_system_message` 的区别只有一处：不追加普通的【收手纪律】，
+    换成【统一纪律】——这一轮要求的是「接受或最后一条修正」，不是继续提新意见。
+    位置也明确写出来：第 1 位是主提出方，必须最后收口；其余是回应者，只表态。
+    """
+    parts = []
+    if persona.role:
+        parts.append(f"【你的角色】\n{persona.role}")
+    parts.append(persona.system_message.strip())
+    parts.append(SPEECH_DISCIPLINE)
+    parts.append(CONVERGENCE_CONTRACT)
+    parts.append(
+        "【这一轮你的位置】\n你是主提出方，最后发言，必须给出最终统一结论。"
+        if opener
+        else "【这一轮你的位置】\n你是回应者，先表态：接受就只回「【无异议】」，"
+        "否则只留最后一条必须修正的地方。"
+    )
+    return "\n\n".join(part for part in parts if part)
 
 
 def full_system_message(persona: Persona, *, opener: bool = False) -> str:
