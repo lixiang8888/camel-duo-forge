@@ -1,11 +1,11 @@
-"""议题：两位专家逐条谈过去，每条产出成果的一节。
+"""议题：专家们逐条谈过去，每条产出成果的一节。
 
 搬运自 camel-fitness-nutrition-duo 的 topics.py，但**议题表本身搬不走**——
 那边写死的是健身饮食的五个议题，这里换成由 `authoring.forge_topics` 按目的生成。
 
 留下来的是三样不随领域变的东西：
 1. `Topic` 的形状（key / section_title / brief / goal / opening）；
-2. 各字段的长度上限——它们每一轮都要进两位专家的 system message，是有真金白银的；
+2. 各字段的长度上限——它们每一轮都要进每位专家的 system message，是有真金白银的；
 3. 收尾议题：它不由模型生成，因为它跟前面每个议题的形状都不一样（见下）。
 """
 
@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 #: 各字段的长度上限。定这些数不是为了防攻击（这是本机跑的东西），
-#: 而是因为 `brief` 和 `goal` 每个议题、每一轮都要原样发给两位专家：
+#: 而是因为 `brief` 和 `goal` 每个议题、每一轮都要原样发给各位专家：
 #: 一个议题写长了，成本是**乘上轮数再乘上议题数**地翻。
 MAX_SECTION_TITLE = 60
 MAX_BRIEF = 400
@@ -23,6 +23,7 @@ MAX_OPENING = 1000
 
 #: 收尾议题的固定 key。society 的提前收手、pipeline 的分岔全靠它认人。
 CLOSING_KEY = "closing"
+
 
 MAX_TOPICS = 12
 
@@ -73,3 +74,4 @@ def closing_topic(count: int, title: str = "") -> Topic:
 
 def is_closing(topic: Topic) -> bool:
     return topic.key == CLOSING_KEY
+
