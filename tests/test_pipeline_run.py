@@ -226,3 +226,30 @@ def test_mock_always_runs_the_full_rounds(blueprint, tmp_path):
         mock=True,
     )
     assert all(t.stopped_early is False for t in result.transcripts)
+
+
+def test_a_three_person_blueprint_runs_end_to_end(blueprint3, tmp_path):
+    result = _run(blueprint3, tmp_path)
+
+    assert result.handbook_path.exists()
+    assert result.transcript_path.exists()
+    for persona in blueprint3.personas:
+        assert persona.name in result.handbook
+    assert "3 个立场与分工不同的智能体" in result.handbook
+    assert result.transcripts[0].turns[0].role == "主提出方"
+
+
+def test_the_editor_is_told_the_team_size(blueprint3, tmp_path, monkeypatch):
+    captured: list[int] = []
+    real = digest.digest_section
+
+    def spy(topic, dialogue, *, backend, title, people=2):
+        captured.append(people)
+        return real(topic, dialogue, backend=backend, title=title, people=people)
+
+    monkeypatch.setattr(digest, "digest_section", spy)
+    _run(blueprint3, tmp_path)
+
+    assert captured
+    assert all(people == 3 for people in captured)
+
