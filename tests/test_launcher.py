@@ -588,7 +588,7 @@ def test_both_manual_still_generates_topics_and_runs(live_server):
     bp = event["blueprint"]
     assert bp["personas"][0]["name"] == "许医师"
     assert bp["personas"][1]["name"] == "老张"
-    assert bp["topics"], "两位都手写时议题仍要由模型生成"
+    assert bp["topics"], "全部手写时议题仍要由模型生成"
     assert _wait_for(q, "done")
     assert server.job.finished.wait(2)
 
@@ -599,3 +599,190 @@ def test_both_manual_still_generates_topics_and_runs(live_server):
     assert _wait_for(q2, "run_done")
     assert _wait_for(q2, "done")
     assert _get_json(port, "/handbook")["markdown"]
+
+
+# ---------------------------------------------------------------------------
+# 多人：人数、团队指令、发言侧
+# ---------------------------------------------------------------------------
+
+
+def _forge_three(server, port, **extra):
+    q = server.bus.subscribe()
+    payload = {
+        "purpose": "给刚上班的程序员写一份颈椎保养手册，要能真的照做。",
+        "topics": 2,
+        "mock": True,
+        "people": 3,
+        "personas": [{}, {}, {}],
+    }
+    payload.update(extra)
+    res = _post(port, "/forge", payload)
+    assert res["ok"], res
+    event = _wait_for(q, "forge_done")
+    assert _wait_for(q, "done")
+    assert server.job.finished.wait(2)
+    return q, event["blueprint"]
+
+
+def test_forge_with_three_people_exposes_three_personas(live_server):
+    server, port = live_server
+    _, bp = _forge_three(server, port)
+
+    assert bp["people"] == 3
+    assert len(bp["personas"]) == 3
+    assert len({p["role"] for p in bp["personas"]}) == 3
+    assert bp["personas"][0]["position"] == "主提出方"
+
+    payload = _get_json(port, "/blueprint")
+    assert payload["people"] == 3
+    assert len(payload["personas"]) == 3
+
+
+def test_forge_rejects_an_out_of_range_people(live_server):
+    _, port = live_server
+    res = _post(
+        port,
+        "/forge",
+        {
+            "purpose": "给刚上班的程序员写一份颈椎保养手册，要能真的照做。",
+            "mock": True,
+            "people": 6,
+        },
+    )
+    assert res["ok"] is False
+    assert "2–5" in res["why"]
+
+
+def test_forge_accepts_a_team_hint(live_server):
+    server, port = live_server
+    _, bp = _forge_three(
+        server, port, teamHint="要有一个医生、一个患者、一个管理者"
+    )
+    assert bp["people"] == 3
+
+
+def test_forge_accepts_a_manual_array_shorter_than_people(live_server):
+    server, port = live_server
+    q = server.bus.subscribe()
+    res = _post(
+        port,
+        "/forge",
+        {
+            "purpose": "给刚上班的程序员写一份颈椎保养手册，要能真的照做。",
+            "topics": 2,
+            "mock": True,
+            "people": 3,
+            "personas": [_MANUAL_PROPOSER],
+        },
+    )
+    assert res["ok"], res
+    bp = _wait_for(q, "forge_done")["blueprint"]
+    assert bp["people"] == 3
+    assert bp["personas"][0]["name"] == "许医师"
+    assert "【发言纪律】" in bp["personas"][0]["system_message"]
+    assert _wait_for(q, "done")
+
+
+def test_three_person_run_reports_personas_and_sides(live_server):
+    server, port = live_server
+    _, bp = _forge_three(server, port)
+
+    first = bp["topics"][0]["key"]
+    q = server.bus.subscribe()
+    res = _post(port, "/run", {"keys": [first], "rounds": 1, "mock": True})
+    assert res["ok"], res
+
+    start = _wait_for(q, "run_start")
+    assert start["people"] == 3
+    assert len(start["personas"]) == 3
+    assert start["personas"][0]["position"] == "主提出方"
+
+    sides = set()
+    roles = set()
+    while True:
+        event = q.get(timeout=15)
+        if event.get("type") == "turn":
+            sides.add(event["side"])
+            roles.add(event["role"])
+        if event.get("type") == "done":
+            break
+
+    assert sides == {"s0", "s1", "s2"}
+    assert roles == {"主提出方", "挑战者", "成本把关人"}
+
+
+def test_page_boot_has_people_bounds(live_server):
+    _, port = live_server
+    html = _get(port, "/")
+    boot = json.loads(re.search(r"const BOOT = (.*?);\n", html).group(1))
+    assert boot["minPeople"] == 2
+    assert boot["maxPeople"] == 5
+    assert boot["defaultPeople"] == 2
+    assert boot["maxRole"] > 0
+    assert boot["maxTeamHint"] > 0
+
+
+# ---------------------------------------------------------------------------
+# 拖入材料：先提炼目的，再锻造
+# ---------------------------------------------------------------------------
+
+
+def test_forge_with_material_distills_then_forges(live_server):
+    server, port = live_server
+    q = server.bus.subscribe()
+
+    res = _post(
+        port,
+        "/forge",
+        {
+            "material": "# 颈椎保养\n\n给刚上班、每天坐十小时的程序员写一份能照做的手册。",
+            "files": ["brief.md", "notes.md"],
+            "topics": 2,
+            "mock": True,
+        },
+    )
+    assert res["ok"], res
+    assert res["material"] is True
+    assert res["files"] == ["brief.md", "notes.md"]
+
+    start = _wait_for(q, "forge_start")
+    assert start["material"] is True
+    assert start["files"] == ["brief.md", "notes.md"]
+
+    distilled = _wait_for(q, "material_distilled")
+    assert distilled["title"]
+    assert distilled["purpose"]
+    assert distilled["files"] == ["brief.md", "notes.md"]
+
+    event = _wait_for(q, "forge_done")
+    assert event["blueprint"]["purpose"]["text"] == distilled["purpose"]
+    assert event["blueprint"]["title"] == distilled["title"]
+
+    assert _wait_for(q, "done")
+    assert server.job.finished.wait(2)
+
+
+def test_forge_rejects_too_long_material(live_server):
+    _, port = live_server
+    res = _post(
+        port,
+        "/forge",
+        {"material": "长" * (launcher.MAX_MATERIAL + 1), "mock": True},
+    )
+    assert res["ok"] is False
+    assert "材料太长" in res["why"]
+
+
+def test_forge_requires_a_purpose_or_material(live_server):
+    _, port = live_server
+    res = _post(port, "/forge", {"mock": True})
+    assert res["ok"] is False
+    assert "没有写目的" in res["why"]
+
+
+def test_page_boot_has_material_limits(live_server):
+    _, port = live_server
+    html = _get(port, "/")
+    boot = json.loads(re.search(r"const BOOT = (.*?);\n", html).group(1))
+    assert boot["maxMaterial"] == launcher.MAX_MATERIAL
+    assert boot["maxMaterialFiles"] == launcher.MAX_MATERIAL_FILES
