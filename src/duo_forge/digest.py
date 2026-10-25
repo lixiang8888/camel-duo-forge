@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Sequence
 
 from camel.agents import ChatAgent
@@ -32,7 +33,8 @@ EDITOR_SYSTEM = """你是《{title}》的文字编辑。
 3. 凡是出现数字的地方，必须保留原数字和单位。
 4. 专家们有分歧的地方，必须如实并列写出各方立场，不要擅自调和、也不要只挑两个人的说法。
 5. 直接输出 Markdown 正文，不要写「好的」「以下是」这类开场白。
-6. 如果对话里某一点说得不具体、无法执行，就不要写进这份文件。"""
+6. 如果对话里某一点说得不具体、无法执行，就不要写进这份文件。
+7. 模板要求在最后单独一行输出分歧状态标记；必须原样输出，不要省略、不要解释。"""
 
 SECTION_TEMPLATE = """议题：{title}
 
@@ -66,6 +68,12 @@ SECTION_TEMPLATE = """议题：{title}
 
 ### 注意
 （这一节里最容易做错、或者不适合哪些人的地方。没有就写「无」。）
+
+最后，在整节输出的**最后单独一行**原样写一个分歧状态标记（只写一个，不要解释，
+也不要把两个都写出来）：
+- 这一节里还有任何各方没有谈拢的点，写：【本节分歧：有】
+- 各方已经完全一致，写：【本节分歧：无】
+
 不要使用一级标题，不要重复输出议题名称之外的标题。"""
 
 CLOSING_TEMPLATE = """以下是各位专家在收尾讨论中的完整对话，以及他们此前各议题的结论摘要：
@@ -87,7 +95,12 @@ CLOSING_TEMPLATE = """以下是各位专家在收尾讨论中的完整对话，�
 
 ## 附录 C · 行动自检清单
 （一份可以定期勾选的清单，用 Markdown 复选框 `- [ ]` 格式，控制在 8 条以内。
- 每条必须是能明确判断「做到 / 没做到」的，不要写「保持好心情」这种无法判定的条目。）"""
+ 每条必须是能明确判断「做到 / 没做到」的，不要写「保持好心情」这种无法判定的条目。）
+
+最后，在整份附录输出的**最后单独一行**原样写一个未解决分歧标记（只写一个，
+不要解释，也不要把两个都写出来）：
+- 整个过程里还有任何始终没有谈拢的点，写：【未解决分歧：有】
+- 所有点都已谈拢，写：【未解决分歧：无】"""
 
 
 # --------------------------------------------------------------------------
@@ -131,15 +144,131 @@ QUICK_TEMPLATE = """这是完整版的全文：
 不要写「各方分歧」这类只有完整版才需要的内容。"""
 
 
+# --------------------------------------------------------------------------
+# 分歧标记：整理环节给 pipeline 的机器契约
+# --------------------------------------------------------------------------
+# 整理出来的成果是自然语言，pipeline 没法可靠地「读懂」它有没有分歧。
+# 所以模板要求编辑在正文最后单独写一个标记，和 society 的【无异议】一样是机器契约；
+# 只是这里允许半角冒号，标记结构不变。拼装成品时由 strip_disagreement_markers 摘掉。
+
+_DISAGREEMENT_MARKER = re.compile(
+    r"【(?:本节分歧|未解决分歧)[ \t]*[:：][ \t]*(?P<state>有|无)】"
+)
+
+#: 整行匹配，连同行尾换行一起删；标记被写在正文中间时再由下面的 sub 兜底。
+_MARKER_LINE = re.compile(
+    r"(?m)^[ \t]*【(?:本节分歧|未解决分歧)[ \t]*[:：][ \t]*(?:有|无)】[ \t]*\n?"
+)
+
+
+def has_disagreement(text: str) -> bool:
+    """这段整理结果是否标着「还有未谈拢的分歧」。
+
+    **没有标记按「无分歧」处理。** 标记是提示词里的硬性格式要求；模型连它都
+    没写，说明这一节的格式已经坏了，把它当成分歧去多跑一轮全员调用并不划算。
+    这一点和 society 的 `_is_concession` 相反，那里的误判会删掉发言，这里
+    最多是多花一轮或少花一轮，所以取更省钱的默认值。
+    """
+    return any(
+        match.group("state") == "有"
+        for match in _DISAGREEMENT_MARKER.finditer(text)
+    )
+
+
+def strip_disagreement_markers(text: str) -> str:
+    """把给代码看的分歧标记从正文里摘掉，不留给读者。"""
+    cleaned = _MARKER_LINE.sub("", text)
+    cleaned = _DISAGREEMENT_MARKER.sub("", cleaned)
+    return cleaned.rstrip() + "\n" if cleaned.strip() else ""
+
+
+def convergence_excerpt(handbook: str) -> str:
+    """从最终成果里抽出统一轮真正需要看的部分。
+
+    只留每节的「要点」、各节的分歧小节、以及附录 A 的分歧备忘。完整版动辄
+    上万字，五个人各读一遍既慢又贵；而统一轮要处理的恰恰只有这几块。
+    抽不出来（格式被模型写坏了）就退回全文，宁可贵一点，也别让统一轮闭着眼统一。
+    """
+    kept: list[str] = []
+    section_title: str | None = None
+    title_emitted = False
+    keep = False
+    for line in handbook.splitlines():
+        if line.startswith("## ") and not line.startswith("### "):
+            section_title = line
+            title_emitted = False
+            keep = False
+            if line.startswith("## 附录 A"):
+                kept.append(line)
+                title_emitted = True
+                keep = True
+            continue
+        if line.startswith("#"):
+            relevant = line.startswith(
+                ("### 要点", "### 两人分歧", "### 各方分歧")
+            )
+            # 正文小节只有在抽到有用的小节时才带上标题，免得留下一串空标题。
+            if relevant and not title_emitted and section_title:
+                kept.append(section_title)
+                title_emitted = True
+            keep = relevant
+            if keep:
+                kept.append(line)
+            continue
+        if keep:
+            kept.append(line)
+
+    excerpt = "\n".join(kept).strip()
+    if not excerpt:
+        return handbook.strip()
+    return "（以下摘自最终成果：各节要点、各节分歧与附录 A。）\n\n" + excerpt
+
+
+def assemble_convergence(
+    unified: str, reservations: Sequence[tuple[str, str]]
+) -> str:
+    """统一轮的成果：统一结论 + 仍保留的意见。
+
+    这一节由代码拼装，不再多花一次模型调用——统一结论就是主提出方在听完
+    所有回应后的那句发言，保留意见就是回应者没有回「【无异议】」的原话。
+    """
+    conclusion = unified.strip() or (
+        "（主提出方在最终轮没有给出明确的统一结论，以下保留意见即为最终状态。）"
+    )
+    lines = [
+        "## 附录 D · 最终统一意见",
+        "",
+        "> 全部议题结束后，专家们又用一轮专门收敛仍未谈拢的地方。",
+        "> 附录 A 记录的是统一前的分歧；统一后的状态以本节为准。",
+        "",
+        "### 统一结论",
+        "",
+        conclusion,
+        "",
+        "### 保留意见",
+        "",
+    ]
+    if reservations:
+        for name, text in reservations:
+            body = (text.strip() or "（没有明确表态）").replace("\n", "\n  ")
+            lines.append(f"- **{name}**：{body}")
+    else:
+        lines.append("- 无。所有回应者都明确表示接受统一结论。")
+    return "\n".join(lines).strip() + "\n"
+
+
 def editor_system(title: str) -> str:
     return EDITOR_SYSTEM.format(title=title)
 
 
-def header(title: str, personas: Sequence[Persona]) -> str:
+def header(title: str, personas: Sequence[Persona], *, unified: bool = False) -> str:
     """成果文件开头的门面。
 
     由代码生成、不走模型：它是**说明这份文件是怎么来的**，不该由被说明的对象
     自己来写（模型写这段时几乎一定会开始加内容）。
+
+    `unified` 表示附上了附录 D。只在真的跑过统一轮时才提它——没跑却写一句
+    「见附录 D」，读者会翻到一个不存在的小节。
     """
     people = len(personas)
     if people == 2:
@@ -162,22 +291,30 @@ def header(title: str, personas: Sequence[Persona]) -> str:
         roster = "\n".join(lines)
         closing = f"所有结论都来自这 {people} 位专家的分歧与妥协。"
 
+    note = "凡是他们没谈拢的地方，附录 A 里原样保留，没有替你抹平。"
+    if unified:
+        note += (
+            "\n> 全部议题结束后，他们又用一轮把仍有分歧的地方收敛成附录 D；"
+            "谁还保留意见，那里逐条写明。"
+        )
+
     return f"""# {title}
 
 {roster}
 >
-> {closing}凡是他们没谈拢的地方，
-> 附录 A 里原样保留，没有替你抹平。
+> {closing}
+> {note}
 
 **怎么用**：先读第一节定基准，再挑对你有用的部分执行。
 不要试图一次全部做到。"""
 
 
-def quick_header(title: str, full_name: str) -> str:
+def quick_header(title: str, full_name: str, *, unified: bool = False) -> str:
+    extra = "、最终统一意见（附录 D）" if unified else ""
     return f"""# {title} · 速查版
 
 > 这是从完整版 `{full_name}` 压缩出来的一页速查：只留最常用的部分，没有新增任何说法。
-> 分节展开的做法、各方始终没谈拢的地方（附录 A）、行动自检清单（附录 C）
+> 分节展开的做法、各方始终没谈拢的地方（附录 A）{extra}、行动自检清单（附录 C）
 > 都在完整版里，需要时再翻。"""
 
 
@@ -232,11 +369,15 @@ def digest_quick(handbook: str, *, backend, title: str) -> str:
     )
 
 
-def assemble(sections: list[str], closing: str, *, header: str) -> str:
+def assemble(
+    sections: list[str], closing: str, *, header: str, convergence: str = ""
+) -> str:
     body = "\n\n---\n\n".join(s.strip() for s in sections if s.strip())
     parts = [header.strip(), body]
     if closing.strip():
         parts.append(closing.strip())
+    if convergence.strip():
+        parts.append(convergence.strip())
     parts.append(footer().strip())
     return "\n\n".join(parts) + "\n"
 
