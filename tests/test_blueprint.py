@@ -50,7 +50,7 @@ def test_save_uses_the_slug_and_a_stamp(blueprint, tmp_path):
 
 
 def test_markdown_shows_the_full_prompts(blueprint):
-    """这是「生成的提示词」的交付形态：两位专家实际拿到的 system message。"""
+    """这是「生成的提示词」的交付形态：各位专家实际拿到的 system message。"""
     text = blueprint.to_markdown()
 
     assert "neck-care" not in text  # slug 是给机器的，不往人看的这份里塞
@@ -97,12 +97,12 @@ def test_future_format_version_is_refused(blueprint):
     assert "99" in str(excinfo.value)
 
 
-def test_a_blueprint_needs_exactly_two_personas(blueprint):
+def test_a_blueprint_needs_two_to_five_personas(blueprint):
     raw = json.loads(blueprint.to_json())
     raw["personas"] = raw["personas"][:1]
     with pytest.raises(BlueprintError) as excinfo:
         from_dict(raw)
-    assert "恰好两位" in str(excinfo.value)
+    assert "2–5 位" in str(excinfo.value)
 
 
 def test_closing_key_is_reserved(blueprint):
@@ -213,3 +213,86 @@ def test_save_does_not_overwrite_a_same_second_blueprint(blueprint, tmp_path):
     assert first != second
     assert second.exists()
     assert load(second) == blueprint
+
+
+# ---------------------------------------------------------------------------
+# format 2 与旧 format 1
+# ---------------------------------------------------------------------------
+
+
+def _raw_with_extra_people(blueprint, extra: int):
+    raw = json.loads(blueprint.to_json())
+    for index in range(extra):
+        raw["personas"].append(
+            {
+                "role": f"角色{index + 3}",
+                "name": f"专家{index + 3}",
+                "title": "身份",
+                "stance": "负责什么",
+                "system_message": "【人格】\n内容",
+            }
+        )
+    return raw
+
+
+def test_format_1_is_upgraded_with_default_roles(blueprint):
+    raw = json.loads(blueprint.to_json())
+    raw["format"] = 1
+    for persona in raw["personas"]:
+        persona.pop("role", None)
+
+    back = from_dict(raw)
+
+    assert back.people == 2
+    assert back.personas[0].role == "主提出方"
+    assert back.personas[1].role == "挑战者"
+    assert back.to_dict()["format"] == blueprint_mod.FORMAT
+
+
+def test_format_1_still_requires_exactly_two(blueprint):
+    raw = _raw_with_extra_people(blueprint, 1)
+    raw["format"] = 1
+    with pytest.raises(BlueprintError) as excinfo:
+        from_dict(raw)
+    assert "恰好两位" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("people", [3, 4, 5])
+def test_two_to_five_personas_round_trip(blueprint, people):
+    raw = _raw_with_extra_people(blueprint, people - 2)
+    back = from_dict(raw)
+
+    assert back.people == people
+    assert json.loads(back.to_json()) == raw
+
+
+def test_duplicate_names_are_rejected(blueprint):
+    raw = json.loads(blueprint.to_json())
+    raw["personas"][1]["name"] = raw["personas"][0]["name"]
+    with pytest.raises(BlueprintError) as excinfo:
+        from_dict(raw)
+    assert "重名" in str(excinfo.value)
+
+
+def test_missing_role_in_format_2_falls_back_for_display(blueprint):
+    raw = json.loads(blueprint.to_json())
+    raw["personas"][0].pop("role")
+    back = from_dict(raw)
+    assert back.personas[0].role == ""
+    assert back.personas[0].display_role == "专家"
+
+
+def test_overlong_role_is_rejected(blueprint):
+    raw = json.loads(blueprint.to_json())
+    raw["personas"][0]["role"] = "长" * 13
+    with pytest.raises(BlueprintError) as excinfo:
+        from_dict(raw)
+    assert "角色名太长" in str(excinfo.value)
+
+
+def test_three_person_markdown_lists_roles(blueprint):
+    back = from_dict(_raw_with_extra_people(blueprint, 1))
+    text = back.to_markdown()
+    assert "## 3 位专家" in text
+    assert "成本把关人" not in text  # 这个是 fixture 里没有的，确认没有凭空出现
+    assert "角色3" in text
