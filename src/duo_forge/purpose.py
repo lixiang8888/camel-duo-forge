@@ -1,6 +1,9 @@
 """用户给的「目的」。
 
-整个项目只有一个输入：一段自由文本。人格、议题、成果物标题全都由它推出来。
+整个项目只有一个核心输入：一段自由文本。人格、议题、成果物标题全都由它推出来。
+
+网页端还允许拖入 `.md` / `.txt` 材料，由 `authoring.distill_material` 先提炼成
+一段目的再进入这里——材料本身不直接进 system message，所以可以比目的长得多。
 
 刻意**只收一段文本**，不收「领域」「受众」「风格」那一堆结构化字段：
 那些东西写进文本里效果一样，而多一个字段就多一个要校验、要解释、要在
@@ -21,6 +24,14 @@ MIN_PURPOSE = 8
 MAX_PURPOSE = 2000
 
 MAX_TITLE = 60
+
+#: 网页拖入材料的总长度上限。材料只用于「提炼目的」这一次调用，不会随每个议题、
+#: 每一轮进入 system message，所以可以比 MAX_PURPOSE 大得多；但也不能无限大，
+#: 否则一次提炼就会把上下文撑爆。
+MAX_MATERIAL = 30000
+
+#: 一次最多合并多少个文件。真正的限制是总字数，这个只是防止一次拖进上百个文件。
+MAX_MATERIAL_FILES = 20
 
 
 class InvalidPurpose(ValueError):
@@ -64,7 +75,7 @@ def make_purpose(text: str, title: str = "") -> Purpose:
     if len(text) > MAX_PURPOSE:
         raise InvalidPurpose(
             f"目的太长了：上限 {MAX_PURPOSE} 字，你给了 {len(text)} 字。"
-            "它会整段进两位专家的 system message，写长了成本是成倍翻的。"
+            "它会整段进各位专家的 system message，写长了成本是成倍翻的。"
         )
     if len(title) > MAX_TITLE:
         raise InvalidPurpose(f"标题太长了：上限 {MAX_TITLE} 字，你给了 {len(title)} 字。")
