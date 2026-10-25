@@ -13,7 +13,7 @@ import pytest
 from duo_forge import blueprint as blueprint_mod
 from duo_forge.blueprint import BlueprintError, from_dict, load
 from duo_forge.personas import Persona
-from duo_forge.topics import CLOSING_KEY
+from duo_forge.topics import CLOSING_KEY, CONVERGENCE_KEY
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +109,15 @@ def test_closing_key_is_reserved(blueprint):
     """收尾议题由代码生成，蓝图里放一个会撞 key。"""
     raw = json.loads(blueprint.to_json())
     raw["topics"][0]["key"] = CLOSING_KEY
+    with pytest.raises(BlueprintError) as excinfo:
+        from_dict(raw)
+    assert "保留" in str(excinfo.value)
+
+
+def test_convergence_key_is_reserved(blueprint):
+    """最终统一轮也不是蓝图里的议题。"""
+    raw = json.loads(blueprint.to_json())
+    raw["topics"][0]["key"] = CONVERGENCE_KEY
     with pytest.raises(BlueprintError) as excinfo:
         from_dict(raw)
     assert "保留" in str(excinfo.value)
