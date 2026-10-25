@@ -34,6 +34,13 @@
 
 `ChatAgent.step()` 返回的 `terminated` 在默认配置下很少为真（上下文超限、
 外部 stop_event 等）。它仍然是一条**保留的安全网**，不是收手机制本身。
+
+## 全部议题结束后的最终统一轮
+
+`pipeline` 发现整理结果里还标着分歧时，会调用 `converge_history` 再跑**一轮**
+（固定一轮，不追加）：回应者先表态——接受就只回 `NO_MORE_OBJECTION`，否则只留
+最后一条修正；主提出方最后听完所有人，给出统一结论。回应者没回那句话的发言
+全部记作保留意见，最终成果里会同时写「统一结论」和「谁还保留什么」。
 """
 
 from __future__ import annotations
@@ -45,7 +52,13 @@ from camel.agents import ChatAgent
 from camel.messages import BaseMessage
 from camel.types import OpenAIBackendRole
 
-from .personas import MAX_PEOPLE, MIN_PEOPLE, Persona, build_system_message
+from .personas import (
+    MAX_PEOPLE,
+    MIN_PEOPLE,
+    Persona,
+    build_convergence_system_message,
+    build_system_message,
+)
 from .topics import Topic
 
 
@@ -110,6 +123,44 @@ class TopicTranscript:
             )
             lines.append(f"{label}：{turn.content}")
         return "\n\n".join(lines)
+
+
+@dataclass
+class ConvergenceResult:
+    """全部议题结束后的最后统一轮。
+
+    这一轮固定只跑一轮：回应者按顺序表态，主提出方最后听完所有人再给结论。
+    `unified` 是主提出方的最终结论；`reservations` 是没回「【无异议】」的回应者
+    及其原话——他们仍然保留意见，成果里要如实写出来，不能强行抹平。
+    """
+
+    turns: list[Turn] = field(default_factory=list)
+    unified: str = ""
+    reservations: tuple[tuple[str, str], ...] = ()
+    #: camel 的终止信号（上下文超限等）在半路响了；这一轮没跑完整。
+    terminated: bool = False
+
+    @property
+    def all_conceded(self) -> bool:
+        return not self.reservations
+
+    def to_markdown(self) -> str:
+        lines = ["## 最终统一意见（全部议题结束后）", ""]
+        lines.append("> 最终成果的要点与分歧摘要已发给所有参与者。")
+        lines.append("")
+        for turn in self.turns:
+            label = (
+                f"{turn.speaker}（{turn.role}）" if turn.role else turn.speaker
+            )
+            lines.append(f"**{label}**：{turn.content}")
+            lines.append("")
+        if self.reservations:
+            who = "、".join(name for name, _ in self.reservations)
+            lines.append(f"> 统一轮结束后，{who} 仍保留意见。")
+        else:
+            lines.append("> 所有回应者都表示接受统一结论。")
+        lines.append("")
+        return "\n".join(lines)
 
 
 def _first_text(response) -> str:
@@ -268,3 +319,97 @@ def debate_topic(
 
     return transcript
 
+
+def converge_history(
+    *,
+    personas: Sequence[Persona],
+    backend,
+    context: str,
+    on_turn: Optional[Callable[[Turn], None]] = None,
+    tools: Optional[Sequence] = None,
+) -> ConvergenceResult:
+    """全部议题结束后的最终统一轮，**固定只跑一轮**。
+
+    `context` 是最终成果的摘要（各节要点、各节分歧、附录 A）。所有人收到同一份；
+    回应者按顺序先表态，主提出方最后听完所有人再给统一结论。
+
+    回应者只回 `NO_MORE_OBJECTION` 才算接受；其余发言——包括「我基本同意，
+    不过……」——都记作保留意见。宁可把一句模糊话记成保留，也不能把真正的
+    反对吞掉：成果里必须让读者看到谁还在担心什么。
+
+    这一轮不设 `rounds` 参数，也不做「再试一轮」：用户要的是用尽量少的轮数收口。
+    一轮之后还没谈拢，就如实写进保留意见。
+    """
+    if not (MIN_PEOPLE <= len(personas) <= MAX_PEOPLE):
+        raise ValueError(
+            f"personas 必须有 {MIN_PEOPLE}–{MAX_PEOPLE} 位，收到 {len(personas)} 位。"
+        )
+
+    people = len(personas)
+    extra = list(tools or ())
+    agents = [
+        ChatAgent(
+            system_message=build_convergence_system_message(
+                persona, opener=(index == 0)
+            ),
+            model=backend,
+            tools=list(extra),
+        )
+        for index, persona in enumerate(personas)
+    ]
+
+    result = ConvergenceResult()
+    order = list(range(1, people)) + [0]
+
+    def record(persona: Persona, content: str) -> None:
+        if not content:
+            return
+        turn = Turn(speaker=persona.name, content=content, role=persona.role)
+        result.turns.append(turn)
+        if on_turn:
+            on_turn(turn)
+
+    # 摘要作为「用户消息」进来：它不是任何一位专家说过的话，不能记成 assistant。
+    # 第一个发言的人通过 step 收到，其他人直接进记忆——和 debate_topic 同一套
+    # 「每条消息在每个人记忆里恰好一次」的做法。
+    context_msg = BaseMessage.make_user_message(role_name="系统", content=context)
+    first = order[0]
+    for index, agent in enumerate(agents):
+        if index != first:
+            agent.update_memory(context_msg, OpenAIBackendRole.USER)
+
+    pending = context_msg
+    responses: dict[int, str] = {}
+
+    for position, who in enumerate(order):
+        response = agents[who].step(pending)
+        text = _first_text(response)
+        responses[who] = text
+        record(personas[who], text)
+
+        outbound = BaseMessage.make_assistant_message(
+            role_name=personas[who].name,
+            content=text or _EMPTY_TURN,
+        )
+        next_who = order[position + 1] if position + 1 < len(order) else order[0]
+        for other in range(people):
+            if other == who or other == next_who:
+                continue
+            agents[other].update_memory(outbound, OpenAIBackendRole.USER)
+        pending = outbound
+
+        if getattr(response, "terminated", False):
+            result.terminated = True
+            break
+
+    # 第 1 位（主提出方）在 order 里永远最后发言，所以正常情况下它最后那句
+    # 就是统一结论。它要是只回了「【无异议】」，那不是一个结论，留空让
+    # digest.assemble_convergence 写兜底话。
+    unified = responses.get(0, "").strip()
+    result.unified = "" if _is_concession(unified) else unified
+    result.reservations = tuple(
+        (personas[who].name, responses.get(who, ""))
+        for who in range(1, people)
+        if not _is_concession(responses.get(who, ""))
+    )
+    return result
