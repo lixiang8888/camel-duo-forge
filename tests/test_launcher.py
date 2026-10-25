@@ -362,6 +362,65 @@ def test_a_second_run_is_rejected_while_a_job_is_running(forged):
     assert "已经有一轮" in res["why"]
 
 
+def test_a_real_run_emits_the_converge_events(forged, monkeypatch):
+    """全部议题结束后还有分歧时，页面要能收到统一轮的开始、结束和保留意见名单。"""
+    from duo_forge import digest, society
+    from duo_forge.backends import ScriptedBackend
+    from duo_forge.society import ConvergenceResult, Turn
+
+    server, port, bp = forged
+    first = bp["topics"][0]["key"]
+    proposer = bp["personas"][0]["name"]
+    challenger = bp["personas"][1]["name"]
+
+    monkeypatch.setattr(
+        launcher, "build_backend", lambda mock=False: ScriptedBackend()
+    )
+    monkeypatch.setattr(
+        digest,
+        "digest_section",
+        lambda *args, **kwargs: "## 节\n内容\n【本节分歧：无】",
+    )
+    monkeypatch.setattr(
+        digest,
+        "digest_closing",
+        lambda *args, **kwargs: "## 附录 A\n内容\n【未解决分歧：有】",
+    )
+
+    def fake_converge(*, personas, backend, context, on_turn=None):
+        result = ConvergenceResult(
+            turns=[
+                Turn(challenger, "我保留：成本没人算。", "挑战者"),
+                Turn(proposer, "统一结论：定稿。", "主提出方"),
+            ],
+            unified="统一结论：定稿。",
+            reservations=((challenger, "成本没人算。"),),
+        )
+        if on_turn:
+            for turn in result.turns:
+                on_turn(turn)
+        return result
+
+    monkeypatch.setattr(society, "converge_history", fake_converge)
+
+    q = server.bus.subscribe()
+    res = _post(
+        port,
+        "/run",
+        {"keys": [first], "rounds": 1, "mock": False, "converge": True},
+    )
+    assert res["ok"], res
+
+    start = _wait_for(q, "converge_start")
+    assert start["people"] == 2
+    done = _wait_for(q, "converge_done")
+    assert done["allConceded"] is False
+    assert done["reservations"] == [challenger]
+    run_done = _wait_for(q, "run_done")
+    assert run_done["handbook"]
+    assert server.job.finished.wait(2)
+
+
 # ---------------------------------------------------------------------------
 # 产物与下载
 # ---------------------------------------------------------------------------
