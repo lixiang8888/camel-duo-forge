@@ -42,13 +42,13 @@ def test_debate_rounds_are_configurable(blueprint, backend):
     assert len(transcript.turns) == 1 + 4 * 2
 
 
-def test_exactly_two_personas_are_required(blueprint, backend):
+def test_two_to_five_personas_are_required(blueprint, backend):
     """顺序即语义，多一个少一个都说明调用方搞错了。"""
     with pytest.raises(ValueError) as excinfo:
         society.debate_topic(
             blueprint.topics[0], personas=blueprint.personas[:1], backend=backend
         )
-    assert "恰好两位" in str(excinfo.value)
+    assert "2–5 位" in str(excinfo.value)
 
 
 def test_mock_backend_never_claims_to_be_real(blueprint, backend):
@@ -232,3 +232,108 @@ def test_quick_prompt_feeds_the_handbook_and_forbids_additions(backend, monkeypa
 
     assert "# 完整版\n正文甲" in captured["prompt"]
     assert "严禁添加完整版里没有的" in captured["system"]
+
+
+# ---------------------------------------------------------------------------
+# 三人：固定轮转、全员收手
+# ---------------------------------------------------------------------------
+
+
+def test_three_person_turn_order(blueprint3, backend):
+    topic = blueprint3.topics[0]
+    transcript = society.debate_topic(
+        topic, personas=blueprint3.personas, backend=backend, rounds=2
+    )
+
+    names = [p.name for p in blueprint3.personas]
+    assert len(transcript.turns) == 1 + 2 * 3
+    assert [t.speaker for t in transcript.turns] == [
+        names[0], names[1], names[2], names[0],
+        names[1], names[2], names[0],
+    ]
+    assert transcript.turns[0].content == topic.opening
+    assert transcript.turns[0].role == "主提出方"
+
+
+class ThreePersonConcedingBackend(ScriptedBackend):
+    """三人模式：第 2 轮的两个回应者都回「无异议」。"""
+
+    def _reply(self, messages):
+        self._calls += 1
+        if self._calls in (4, 5):
+            return society.NO_MORE_OBJECTION
+        return f"[假后端] 第 {self._calls} 次调用，这里本应是一段具体论证。"
+
+
+class ThreePersonOneDissentBackend(ScriptedBackend):
+    """第 2 轮只有第一位回应者收手，第二位仍有意见。"""
+
+    def _reply(self, messages):
+        self._calls += 1
+        if self._calls == 4:
+            return society.NO_MORE_OBJECTION
+        if self._calls == 5:
+            return "我还有一点：这个方案的成本没人算过。"
+        return f"[假后端] 第 {self._calls} 次调用，这里本应是一段具体论证。"
+
+
+def test_all_responders_conceding_stops_the_debate(blueprint3):
+    transcript = society.debate_topic(
+        blueprint3.topics[0],
+        personas=blueprint3.personas,
+        backend=ThreePersonConcedingBackend(),
+        rounds=4,
+        early_stop=True,
+    )
+
+    assert transcript.stopped_early is True
+    assert transcript.rounds_run == 2
+    assert len(transcript.turns) == 1 + 2 * 3
+    assert transcript.conceding == ("老张", "算账方")
+    assert "已无新的反对意见" in transcript.to_markdown()
+
+
+def test_one_dissenting_responder_keeps_the_debate_going(blueprint3):
+    transcript = society.debate_topic(
+        blueprint3.topics[0],
+        personas=blueprint3.personas,
+        backend=ThreePersonOneDissentBackend(),
+        rounds=4,
+        early_stop=True,
+    )
+
+    assert transcript.stopped_early is False
+    assert transcript.rounds_run == 4
+    assert len(transcript.turns) == 1 + 4 * 3
+
+
+def test_a_three_person_debate_can_only_stop_after_min_rounds(blueprint3):
+    class EarlyConceders(ScriptedBackend):
+        def _reply(self, messages):
+            self._calls += 1
+            # 第 1 轮两个回应者就收手（调用 1、2），第 2 轮再次收手（4、5）
+            return society.NO_MORE_OBJECTION
+
+    transcript = society.debate_topic(
+        blueprint3.topics[0],
+        personas=blueprint3.personas,
+        backend=EarlyConceders(),
+        rounds=4,
+        early_stop=True,
+    )
+
+    assert transcript.stopped_early is True
+    assert transcript.rounds_run == 2
+
+
+def test_roles_appear_in_the_transcript(blueprint3, backend):
+    transcript = society.debate_topic(
+        blueprint3.topics[0], personas=blueprint3.personas, backend=backend, rounds=1
+    )
+
+    dialogue = transcript.as_dialogue()
+    assert "康复师（主提出方）" in dialogue
+    assert "老张（挑战者）" in dialogue
+    assert "算账方（成本把关人）" in dialogue
+    assert "（主提出方）" in transcript.to_markdown()
+
