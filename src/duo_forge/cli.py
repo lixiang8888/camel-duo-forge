@@ -300,9 +300,18 @@ def _cmd_run(args: argparse.Namespace) -> int:
         # 每个议题 = 每轮 N 次发言 + 1 次整理，开场白不花调用；末尾再花 1 次压速查。
         # 这是**上限**：所有回应者都没有新的反对意见时该议题会提前收手。
         calls = len(topics) * (args.rounds * bp.people + 1) + 1
+        unify_note = ""
+        if args.converge:
+            # 全部议题结束后如果成果里仍标着分歧，会再补一轮统一（人数次调用）。
+            calls += bp.people
+            unify_note = (
+                f"\n全部议题结束后，如果成果里仍有未统一的分歧，"
+                f"会再花最多 {bp.people} 次调用补一轮强制统一。"
+            )
         print(
             f"真实模式：本次最多约 {calls} 次模型调用，每次通常十几秒，"
-            f"最多约 {max(1, round(calls * 16 / 60))} 分钟。跑的过程中会逐条打印进展。\n"
+            f"最多约 {max(1, round(calls * 16 / 60))} 分钟。跑的过程中会逐条打印进展。"
+            f"{unify_note}\n"
         )
 
     def run_start(total: int, rounds: int) -> None:
@@ -319,10 +328,13 @@ def _cmd_run(args: argparse.Namespace) -> int:
         if args.mock:
             print(f"议题数：{total}，每个议题 {rounds} 轮\n")
         else:
-            print(
-                f"议题数：{total}，每个议题最多 {rounds} 轮"
-                f"（上限；所有回应者都没有新的反对意见会提前收手）\n"
+            tail = (
+                "（上限；所有回应者都没有新的反对意见会提前收手；"
+                "全部议题结束后若仍有分歧，会再补一轮强制统一）"
+                if args.converge
+                else "（不做收敛处理，每个议题跑满）"
             )
+            print(f"议题数：{total}，每个议题最多 {rounds} 轮{tail}\n")
 
     def run_done(result) -> None:
         print(f"\n对话实录：{result.transcript_path}")
@@ -354,6 +366,16 @@ def _cmd_run(args: argparse.Namespace) -> int:
 def _hooks(run_start, run_done):
     from . import pipeline
 
+    def unify_start() -> None:
+        print("\n全部议题已结束：成果里仍有未统一的分歧，追加一轮强制统一……")
+
+    def unify_done(result) -> None:
+        if result.all_conceded:
+            print("    统一轮完成：所有回应者都接受统一结论")
+        else:
+            who = "、".join(name for name, _ in result.reservations)
+            print(f"    统一轮结束：{who} 仍保留意见，已写进附录 D")
+
     return pipeline.PipelineHooks(
         on_run_start=run_start,
         on_topic_start=lambda index, total, topic: print(
@@ -364,6 +386,8 @@ def _hooks(run_start, run_done):
         on_section_done=lambda topic, is_final, markdown: print(
             "    已整理出附录" if is_final else "    已整理成正文一节"
         ),
+        on_unify_start=unify_start,
+        on_unify_done=unify_done,
         on_run_done=run_done,
     )
 
@@ -423,7 +447,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     run.add_argument(
         "--no-converge", dest="converge", action="store_false",
-        help="跑满每个议题的轮数，不做「所有回应者都没有新的反对意见就提前收手」的判断",
+        help=(
+            "关闭所有收敛处理：每个议题跑满轮数，全部议题结束后也不做最终统一"
+        ),
     )
     run.add_argument(
         "--only", default="",
