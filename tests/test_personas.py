@@ -10,9 +10,13 @@ import pytest
 from duo_forge.personas import (
     MAX_MANUAL_SYSTEM_MESSAGE,
     MAX_NAME,
+    MAX_PEOPLE,
     MAX_PERSONA_HINT,
     MAX_PERSONA_TITLE,
+    MAX_ROLE,
     MAX_STANCE,
+    MAX_TEAM_HINT,
+    MIN_PEOPLE,
     PersonaPlan,
     PersonaSpecError,
     parse_persona_plan,
@@ -215,7 +219,8 @@ def test_manual_cannot_carry_a_hint():
         ({"proposer": {"mode": "unknown"}}, "mode 不合法"),
         ({"proposer": {"mode": "manual", "typo": "x"}}, "不认识的字段"),
         ({"proposer": "不是对象"}, "必须是一个 JSON 对象"),
-        ({"personas": []}, "不认识的键"),
+        ({"unknown": 1}, "不认识的键"),
+        ({"personas": "不是数组"}, "必须是一个数组"),
         ([], "必须是一个 JSON 对象"),
     ],
 )
@@ -234,3 +239,155 @@ def test_both_sides_may_be_manual():
 
 def test_the_default_plan_is_auto():
     assert PersonaPlan().all_auto
+
+
+# ---------------------------------------------------------------------------
+# 多人：人数、数组、角色名、团队要求
+# ---------------------------------------------------------------------------
+
+
+def test_people_is_inferred_from_the_personas_array():
+    plan = parse_persona_plan(
+        {
+            "personas": [
+                _manual(name="甲"),
+                {"mode": "hint", "hint": "一位实用派教练"},
+                {},
+            ]
+        }
+    )
+    assert plan.people == 3
+    assert len(plan.specs) == 3
+    assert plan.specs[0].mode == "manual"
+    assert plan.specs[1].mode == "hint"
+    assert plan.specs[2].is_auto
+
+
+def test_people_pads_missing_specs_with_auto():
+    plan = parse_persona_plan({"personas": [_manual()]}, people=4)
+    assert plan.people == 4
+    assert [spec.mode for spec in plan.specs] == [
+        "manual", "auto", "auto", "auto"
+    ]
+
+
+def test_people_accepts_an_array_shorter_than_the_count():
+    plan = parse_persona_plan({"personas": [_manual(), _manual(name="乙")]}, people=5)
+    assert plan.people == 5
+    assert len(plan.specs) == 5
+    assert all(spec.is_auto for spec in plan.specs[2:])
+
+
+def test_people_rejects_more_specs_than_the_count():
+    with pytest.raises(PersonaSpecError) as excinfo:
+        parse_persona_plan(
+            {"personas": [_manual(), _manual(name="乙"), _manual(name="丙")]},
+            people=2,
+        )
+    assert "超过了人数" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("people", [1, 6, 0, "3", True])
+def test_people_out_of_range_is_rejected(people):
+    with pytest.raises(PersonaSpecError) as excinfo:
+        parse_persona_plan({}, people=people)
+    assert f"{MIN_PEOPLE}–{MAX_PEOPLE}" in str(excinfo.value)
+
+
+def test_missing_people_defaults_to_two():
+    plan = parse_persona_plan({})
+    assert plan.people == 2
+    assert plan.all_auto
+
+
+def test_empty_personas_array_means_all_auto():
+    plan = parse_persona_plan({"personas": []})
+    assert plan.people == 2
+    assert plan.all_auto
+
+
+def test_array_wins_over_legacy_keys():
+    plan = parse_persona_plan(
+        {
+            "personas": [_manual(name="甲")],
+            "proposer": _manual(name="乙"),
+            "challenger": _manual(name="丙"),
+        },
+        people=2,
+    )
+    assert plan.specs[0].name == "甲"
+    assert plan.specs[1].is_auto
+
+
+def test_manual_role_is_parsed():
+    spec = parse_persona_spec(_manual(role="成本把关人"), LABEL)
+    assert spec.role == "成本把关人"
+
+
+def test_manual_role_has_a_length_limit():
+    with pytest.raises(PersonaSpecError) as excinfo:
+        parse_persona_spec(_manual(role="长" * (MAX_ROLE + 1)), LABEL)
+    assert "角色名" in str(excinfo.value)
+
+
+def test_manual_role_must_be_single_line():
+    with pytest.raises(PersonaSpecError) as excinfo:
+        parse_persona_spec(_manual(role="第一行\n第二行"), LABEL)
+    assert "单行" in str(excinfo.value)
+
+
+def test_manual_without_role_gets_a_positional_default():
+    spec = parse_persona_spec(_manual(), LABEL)
+    assert spec.role == ""
+    assert spec.to_persona(1, 3).role == "主提出方"
+    assert spec.to_persona(2, 3).role == "专家 2"
+    assert spec.to_persona(2, 2).role == "挑战者"
+
+
+def test_team_hint_is_parsed_and_stripped():
+    plan = parse_persona_plan({"team": "  要有一个医生、一个患者、一个管理者  "})
+    assert plan.team_hint == "要有一个医生、一个患者、一个管理者"
+
+
+def test_team_hint_can_be_empty():
+    assert parse_persona_plan({}).team_hint == ""
+    assert parse_persona_plan({"team": ""}).team_hint == ""
+
+
+def test_team_hint_has_a_length_limit():
+    with pytest.raises(PersonaSpecError) as excinfo:
+        parse_persona_plan({"team": "长" * (MAX_TEAM_HINT + 1)})
+    assert "团队分工要求太长" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("marker", ["【发言纪律】", "【收手纪律】"])
+def test_team_hint_cannot_contain_the_discipline(marker):
+    with pytest.raises(PersonaSpecError) as excinfo:
+        parse_persona_plan({"team": marker + "随便写"})
+    assert marker in str(excinfo.value)
+
+
+def test_persona_plan_pads_itself():
+    plan = PersonaPlan(people=3)
+    assert plan.people == 3
+    assert len(plan.specs) == 3
+    assert plan.all_auto
+
+
+def test_persona_plan_rejects_too_many_specs():
+    with pytest.raises(PersonaSpecError):
+        PersonaPlan(
+            specs=(parse_persona_spec(_manual(), LABEL),) * 3,
+            people=2,
+        )
+
+
+def test_three_manual_personas_are_all_manual():
+    plan = parse_persona_plan(
+        {"personas": [_manual(), _manual(name="乙"), _manual(name="丙")]},
+        people=3,
+    )
+    assert plan.all_manual
+    assert plan.has_manual
+    assert not plan.all_auto
+    assert not plan.both_manual
