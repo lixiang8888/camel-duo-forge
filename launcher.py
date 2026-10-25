@@ -76,15 +76,22 @@ from duo_forge.config import (
 from duo_forge.personas import (
     MAX_MANUAL_SYSTEM_MESSAGE,
     MAX_NAME,
+    MAX_PEOPLE,
     MAX_PERSONA_HINT,
     MAX_PERSONA_TITLE,
+    MAX_ROLE,
     MAX_STANCE,
+    MAX_TEAM_HINT,
+    MIN_PEOPLE,
     PersonaPlan,
     PersonaSpecError,
     full_system_message,
     parse_persona_plan,
+    parse_team_hint,
 )
 from duo_forge.purpose import (
+    MAX_MATERIAL,
+    MAX_MATERIAL_FILES,
     MAX_PURPOSE,
     MIN_PURPOSE,
     InvalidPurpose,
@@ -220,10 +227,11 @@ class _Job:
 
 
 class _ForgeJob(_Job):
-    """目的 → 蓝图。
+    """目的（或材料）→ 蓝图。
 
-    正常两次模型调用（人格 + 议题，重试时最多四次）；只自定义一位仍是两次；
-    两位都手写时只有一次（议题）。
+    两人正常两次调用（人格 + 议题）；三人及以上三次（团队骨架 + 人格 + 议题）；
+    全部手写时只有一次（议题）。如果用户拖入了材料，会先多一次「材料 → 目的」的
+    提炼调用，再走上面的流程。
     """
 
     kind = "forge"
@@ -233,17 +241,22 @@ class _ForgeJob(_Job):
         self,
         server: "_Server",
         *,
-        purpose: Purpose,
+        purpose: Optional[Purpose],
         topic_count: int,
         mock: bool,
         plan: PersonaPlan,
+        material: str = "",
+        files: Optional[list[str]] = None,
     ) -> None:
         super().__init__(server.bus)
         self.server = server
+        #: 有 material 时这里是 None，worker 提炼完之后再填。
         self.purpose = purpose
+        self.material = material.strip()
+        self.files = list(files or [])
         self.topic_count = topic_count
         self.mock = mock
-        #: 用户对两位专家的自定义意图。准入时冻结，worker 里只读。
+        #: 用户对团队和每位专家的自定义意图。准入时冻结，worker 里只读。
         self.plan = plan
 
     def _cancelled_or_superseded(self) -> bool:
@@ -263,14 +276,36 @@ class _ForgeJob(_Job):
 
             self._emit(
                 "forge_start",
-                purpose=self.purpose.summary(),
+                purpose=self.purpose.summary() if self.purpose else "",
                 topics=self.topic_count,
+                people=self.plan.people,
                 mock=self.mock,
+                material=bool(self.material),
+                files=self.files,
             )
             backend = build_author_backend(mock=self.mock)
 
-            # 两位都手写时没有「设计专家」这一步，别在页面上报一个不存在的阶段。
-            if not self.plan.both_manual:
+            if self.material:
+                # 材料可能是一整份长文档，不直接进 system message：
+                # 先压成一段 ≤2000 字的目的，后面的流程只认 Purpose。
+                self._emit("forge_stage", stage="distill")
+                self.purpose = authoring.distill_material(
+                    self.material, backend=backend, files=self.files
+                )
+                if self._cancel_if_needed():
+                    return
+                self._emit(
+                    "material_distilled",
+                    title=self.purpose.title,
+                    purpose=self.purpose.text,
+                    files=self.files,
+                )
+
+            if self.purpose is None:
+                raise RuntimeError("锻造任务既没有目的，也没有材料。")
+
+            # 全部手写时没有「设计专家」这一步，别在页面上报一个不存在的阶段。
+            if not self.plan.all_manual:
                 self._emit("forge_stage", stage="personas")
             forged = authoring.forge_personas(
                 self.purpose, backend=backend, plan=self.plan
@@ -351,29 +386,30 @@ class _RunJob(_Job):
 
     def _hooks(self) -> pipeline.PipelineHooks:
         emit = self._emit
-        proposer = self.blueprint.proposer
-        challenger = self.blueprint.challenger
+        personas = self.blueprint.personas
+        side_of = {persona.name: index for index, persona in enumerate(personas)}
 
         def run_start(total: int, rounds: int) -> None:
             emit(
                 "run_start",
                 total=total,
                 rounds=rounds,
+                people=len(personas),
                 mock=self.mock,
                 converge=self.converge,
                 topics=[
                     {"key": t.key, "title": t.section_title} for t in self.topics
                 ],
-                proposer={
-                    "name": proposer.name,
-                    "title": proposer.title,
-                    "stance": proposer.stance,
-                },
-                challenger={
-                    "name": challenger.name,
-                    "title": challenger.title,
-                    "stance": challenger.stance,
-                },
+                personas=[
+                    {
+                        "name": p.name,
+                        "role": p.display_role,
+                        "title": p.title,
+                        "stance": p.stance,
+                        "position": "主提出方" if index == 0 else "回应者",
+                    }
+                    for index, p in enumerate(personas)
+                ],
             )
 
         def topic_start(index: int, total: int, topic) -> None:
@@ -390,7 +426,8 @@ class _RunJob(_Job):
                 "turn",
                 topic=topic.key,
                 speaker=t.speaker,
-                side="a" if t.speaker == proposer.name else "b",
+                role=t.role or "",
+                side=f"s{side_of.get(t.speaker, 0)}",
                 text=t.content,
             )
 
@@ -401,6 +438,7 @@ class _RunJob(_Job):
                 turns=len(transcript.turns),
                 early=transcript.stopped_early,
                 roundsRun=transcript.rounds_run,
+                conceding=list(transcript.conceding),
             )
 
         def section_start(topic, is_closing: bool) -> None:
@@ -479,15 +517,18 @@ def _blueprint_payload(bp: Blueprint, path: Optional[Path] = None) -> dict:
         "origin": bp.origin,
         "title": bp.title,
         "slug": bp.slug,
+        "people": bp.people,
         "path": str(path) if path else "",
         "markdown": bp.to_markdown(),
         "purpose": {"text": bp.purpose.text, "title": bp.purpose.title},
         "personas": [
             {
+                "role": p.display_role,
                 "name": p.name,
                 "title": p.title,
                 "stance": p.stance,
-                "system_message": full_system_message(p, challenger=(index == 1)),
+                "position": "主提出方" if index == 0 else "回应者",
+                "system_message": full_system_message(p, opener=(index == 0)),
             }
             for index, p in enumerate(bp.personas)
         ],
@@ -654,19 +695,70 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _forge(self, body: dict) -> None:
         server = self.server
-        try:
-            purpose = make_purpose(
-                str(body.get("purpose") or ""),
-                str(body.get("title") or ""),
-            )
-        except InvalidPurpose as exc:
-            self._json({"ok": False, "why": str(exc)})
-            return
 
-        # 和目的一样，人格设定必须在准入/清历史之前校验完：
+        # 拖入材料时，目的由模型从材料里提炼；此时 purpose/title 不参与本次锻造。
+        raw_material = body.get("material")
+        material = raw_material.strip() if isinstance(raw_material, str) else ""
+        raw_files = body.get("files")
+        files: list[str] = []
+        if isinstance(raw_files, list):
+            for name in raw_files:
+                if isinstance(name, str) and name.strip():
+                    files.append(name.strip()[:200])
+                    if len(files) >= MAX_MATERIAL_FILES:
+                        break
+
+        if material:
+            if len(material) > MAX_MATERIAL:
+                self._json(
+                    {
+                        "ok": False,
+                        "why": (
+                            f"材料太长：上限 {MAX_MATERIAL} 字，"
+                            f"收到 {len(material)} 字。请先精简材料。"
+                        ),
+                    }
+                )
+                return
+            purpose: Optional[Purpose] = None
+        else:
+            try:
+                purpose = make_purpose(
+                    str(body.get("purpose") or ""),
+                    str(body.get("title") or ""),
+                )
+            except InvalidPurpose as exc:
+                self._json({"ok": False, "why": str(exc)})
+                return
+
+        # 和目的一样，人格/人数设定必须在准入/清历史之前校验完：
         # 写错一个字不该把上一轮蓝图和对话历史擦掉。
+        raw_people = body.get("people")
+        people = None
+        if raw_people is not None:
+            try:
+                people = int(raw_people)
+            except (TypeError, ValueError):
+                self._json({"ok": False, "why": "人数必须是整数。"})
+                return
+        raw_personas = body.get("personas")
+        if isinstance(raw_personas, list):
+            # 新前端按位置传数组；包成 personas 文件同款结构再走同一套解析。
+            raw_plan: object = {"personas": raw_personas}
+        elif raw_personas is None or isinstance(raw_personas, dict):
+            # None / 旧版 {proposer, challenger} / 人格文件同款都原样交给解析器。
+            raw_plan = raw_personas
+        else:
+            raw_plan = raw_personas  # 交给解析器报一个能看懂的类型错误
+        team_hint = str(body.get("teamHint") or "").strip()
         try:
-            plan = parse_persona_plan(body.get("personas"))
+            plan = parse_persona_plan(raw_plan, people=people)
+            if team_hint:
+                plan = PersonaPlan(
+                    specs=plan.specs,
+                    team_hint=parse_team_hint(team_hint),
+                    people=plan.people,
+                )
         except PersonaSpecError as exc:
             self._json({"ok": False, "why": str(exc)})
             return
@@ -685,6 +777,8 @@ class _Handler(BaseHTTPRequestHandler):
             job = _ForgeJob(
                 server,
                 purpose=purpose,
+                material=material,
+                files=files,
                 topic_count=count,
                 mock=mock,
                 plan=plan,
@@ -693,7 +787,15 @@ class _Handler(BaseHTTPRequestHandler):
             # 校验都过了才清历史：填错一个字就把上一轮蓝图的对话历史擦掉太难受。
             server.bus.reset()
         job.start()
-        self._json({"ok": True, "topics": count, "mock": mock})
+        self._json(
+            {
+                "ok": True,
+                "topics": count,
+                "mock": mock,
+                "material": bool(material),
+                "files": files,
+            }
+        )
 
     def _run(self, body: dict) -> None:
         server = self.server
@@ -892,14 +994,21 @@ def _boot_payload(server: _Server) -> dict:
         "maxTopics": MAX_TOPICS,
         "minPurpose": MIN_PURPOSE,
         "maxPurpose": MAX_PURPOSE,
+        "maxMaterial": MAX_MATERIAL,
+        "maxMaterialFiles": MAX_MATERIAL_FILES,
         "defaultRounds": 3,
         "minRounds": MIN_ROUNDS,
         "maxRounds": MAX_ROUNDS,
+        "minPeople": MIN_PEOPLE,
+        "maxPeople": MAX_PEOPLE,
+        "defaultPeople": MIN_PEOPLE,
         "maxManualSystemMessage": MAX_MANUAL_SYSTEM_MESSAGE,
         "maxPersonaHint": MAX_PERSONA_HINT,
         "maxName": MAX_NAME,
         "maxPersonaTitle": MAX_PERSONA_TITLE,
         "maxStance": MAX_STANCE,
+        "maxRole": MAX_ROLE,
+        "maxTeamHint": MAX_TEAM_HINT,
         "closing": {
             "key": CLOSING_KEY,
             "title": closing_topic(0).section_title,
@@ -923,7 +1032,8 @@ _PAGE = r"""<!DOCTYPE html>
     --bg: #f6f7f9;      --panel: #ffffff;   --fg: #1f2328;
     --muted: #59636e;   --border: #d8dee4;  --accent: #1f6feb;
     --accent-hi: #1a5fd0; --warn: #9a6700;  --bad: #b42318;
-    --a: #0969da;       --b: #1a7f37;
+    --s0: #0969da;      --s1: #1a7f37;      --s2: #8250df;
+    --s3: #bc4c00;      --s4: #b42318;
   }
   * { box-sizing: border-box; }
   body {
@@ -966,8 +1076,22 @@ _PAGE = r"""<!DOCTYPE html>
   button.primary:hover:not(:disabled) { background: var(--accent-hi); }
   .hint { font-size: 12.5px; color: var(--muted); margin-top: 8px; }
   .hint.cost { color: var(--warn); }
+  #step1.dragging { outline: 2px dashed var(--accent); outline-offset: -4px; background: #f5f9ff; }
+  .drop-hint { font-size: 12.5px; color: var(--muted); margin-top: 8px; }
+  .drop-hint button { padding: 4px 10px; font-size: 12.5px; margin-left: 6px; }
+  .material { margin-top: 10px; border: 1px dashed var(--border); border-radius: 6px;
+              padding: 8px 11px; font-size: 12.5px; background: var(--panel); }
+  .material .mf { font-weight: 600; word-break: break-all; }
+  .material .mm { color: var(--muted); margin-top: 2px; }
+  .material details { margin-top: 6px; }
+  .material summary { font-size: 12.5px; color: var(--accent); cursor: pointer; }
+  .material pre { max-height: 180px; overflow: auto; white-space: pre-wrap; word-break: break-word;
+                  font-size: 12.5px; background: var(--bg); border-radius: 5px; padding: 8px; margin: 6px 0 0; }
   details.custom { margin-top: 10px; border-top: 1px dashed var(--border); padding-top: 10px; }
   details.custom > summary { font-size: 13px; color: var(--accent); cursor: pointer; user-select: none; }
+  #teamHint { width: 100%; min-height: 58px; resize: vertical; margin-top: 6px; }
+  .custom .team-label { display: block; font-size: 12.5px; color: var(--muted); margin-top: 10px; }
+  .custom .ecount { font-size: 11.5px; color: var(--muted); text-align: right; }
   .persona-editors { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; }
   .editor { flex: 1 1 380px; border: 1px solid var(--border); border-radius: 6px; padding: 9px 11px; }
   .editor .ehead { font-weight: 600; font-size: 13px; margin-bottom: 6px; }
@@ -1015,8 +1139,11 @@ _PAGE = r"""<!DOCTYPE html>
   .topic-head:first-child { border-top: 0; margin-top: 4px; padding-top: 0; }
   .msg { padding: 8px 0 2px; white-space: pre-wrap; }
   .msg .src { display: block; font-size: 12px; letter-spacing: .04em; margin-bottom: 2px; font-weight: 600; }
-  .msg.a .src { color: var(--a); }
-  .msg.b .src { color: var(--b); }
+  .msg.s0 .src { color: var(--s0); }
+  .msg.s1 .src { color: var(--s1); }
+  .msg.s2 .src { color: var(--s2); }
+  .msg.s3 .src { color: var(--s3); }
+  .msg.s4 .src { color: var(--s4); }
   .empty { color: var(--muted); padding: 22px 0; text-align: center; }
   #bpView, #out { padding: 4px 18px 18px; max-height: calc(100vh - 380px); overflow-y: auto; }
   #bpView h1, #out h1 { font-size: 20px; margin: 18px 0 8px; white-space: normal; }
@@ -1072,6 +1199,9 @@ _PAGE = r"""<!DOCTYPE html>
       placeholder="说清「给谁、要解决什么、想要什么形态的成果」，例如：给刚上班、每天坐十小时的程序员写一份颈椎保养手册，要能真的照做。"></textarea>
     <div class="row">
       <input type="text" id="title" maxlength="60" placeholder="标题（留空由模型起）">
+      <span style="font-size:13px">对话人数</span>
+      <select id="people"></select>
+      <span style="font-size:13px">位</span>
       <span style="font-size:13px">生成</span>
       <select id="topicCount"></select>
       <span style="font-size:13px">个议题</span>
@@ -1081,15 +1211,31 @@ _PAGE = r"""<!DOCTYPE html>
       <span class="spacer"></span>
       <button class="primary" id="forgeBtn">锻造蓝图</button>
     </div>
-    <div class="hint cost" id="forgeHint">
-      正常调用模型两次（人格 + 议题；格式不对会重试，最多四次）。两位专家都由你手写时
-      只调用一次（议题）。模拟模式不联网、不花钱，产出是占位内容。
+    <div class="hint cost" id="forgeHint"></div>
+
+    <div class="drop-hint" id="dropHint">
+      也可以把一份或多份 .md / .txt 拖到这里：自动提炼目的并锻造蓝图（停在审阅）。
+      <button type="button" id="pickFiles">选择文件</button>
+      <input type="file" id="fileInput" multiple accept=".md,.markdown,.txt" hidden>
+    </div>
+    <div id="materialBox" class="material hidden">
+      <div class="mf" id="materialFiles"></div>
+      <div class="mm" id="materialMeta"></div>
+      <details id="materialDetails" class="hidden">
+        <summary>预览材料开头</summary>
+        <pre id="materialPreview"></pre>
+      </details>
+      <div class="hint">材料内容会发给模型用于提炼目的。</div>
     </div>
 
     <details id="customBox" class="custom">
-      <summary>自定义人格（可选）—— 选「交给模型生成」或留空就由模型生成</summary>
+      <summary>自定义团队与人格（可选）—— 留空就由 AI 自行分工</summary>
+      <label class="team-label" for="teamHint">团队分工要求（可选，例如「要有一个一线医生、一个患者、一个管理者」）</label>
+      <textarea id="teamHint"></textarea>
+      <div class="ecount" id="teamHintCount"></div>
       <div class="persona-editors" id="personaEditors"></div>
       <div class="hint">
+        每位参与者可以分别选「交给模型生成」「给个方向」或「我自己写」。
         手写的人格设定里不要写「发言纪律」「收手纪律」——这两段由系统自动追加，写了会重复。
         人格设定最多 <span id="manualLimit">12000</span> 字；它会随每个议题、每一轮发给模型，
         越长越贵。长期背景与案例直接写进人格设定里即可。
@@ -1109,7 +1255,7 @@ _PAGE = r"""<!DOCTYPE html>
       <span style="font-size:13px">每个议题最多</span>
       <select id="rounds"></select>
       <label style="font-size:13px;display:flex;align-items:center;gap:5px;cursor:pointer"
-             title="挑战者提不出新的反对意见时，这个议题就到此为止，不再跑满上面的轮数">
+             title="所有回应者都提不出新的反对意见时，这个议题就到此为止，不再跑满上面的轮数">
         <input type="checkbox" id="converge" checked> 谈拢了就收手
       </label>
       <label style="font-size:13px;display:flex;align-items:center;gap:5px;cursor:pointer">
@@ -1159,8 +1305,17 @@ let lastSeq = -1;          // 去重：重连/重放时同一事件不会渲染�
 let bp = null;             // 当前蓝图的结构化数据
 let running = false;
 let jobKind = "";          // "forge" | "run"
+let pendingMaterial = "";  // 已经读进浏览器的材料全文
+let pendingFiles = [];     // 材料文件名
+let materialQueued = false; // 下一次 forge 会不会多一次「材料提炼」调用
 
 // ---- 初始化控件的可选项 ----
+for (let n = BOOT.minPeople; n <= BOOT.maxPeople; n++) {
+  const o = document.createElement("option");
+  o.value = String(n); o.textContent = String(n);
+  $("people").appendChild(o);
+}
+$("people").value = String(BOOT.defaultPeople);
 for (let n = 1; n <= BOOT.maxTopics; n++) {
   const o = document.createElement("option");
   o.value = String(n); o.textContent = String(n);
@@ -1191,21 +1346,35 @@ function updatePurposeCount() {
 $("purpose").addEventListener("input", () => { savePurpose(); updatePurposeCount(); });
 updatePurposeCount();
 
-// ---- 自定义人格 ----
-// 每位专家独立选 auto / hint / manual。只把非 auto 的侧发给后端；
+// ---- 自定义团队与人格 ----
+// 每位参与者独立选 auto / hint / manual。只把非 auto 的位置发给后端；
 // 后端会用同一套 personas.parse_persona_plan 再校验一遍（前端校验只为早点提示）。
 const PERSONA_STORE = "duo-forge-personas";
-const SIDES = [
-  { key: "proposer", label: "第一位 · 方案提出方",
-    hint: "例如：三甲医院康复科物理治疗师，只认证据和量化" },
-  { key: "challenger", label: "第二位 · 挑战者",
-    hint: "例如：带过两百个程序员的实战派教练，只问做不做得到" },
+const TEAM_STORE = "duo-forge-team";
+const SLOT_HINTS = [
+  "例如：三甲医院康复科物理治疗师，只认证据和量化",
+  "例如：带过两百个程序员的实战派教练，只问做不做得到",
+  "例如：负责预算和排期的项目负责人，只问代价划不划算",
+  "例如：一线执行者，只问现场做不做得到",
+  "例如：最终使用者代表，只问对我有什么影响",
 ];
 const MANUAL_TEMPLATE =
   "【人格】\n…\n\n【专业立场】\n…\n\n【你的盲区，不要掩饰】\n…\n\n" +
   "【长期背景与案例】（可选）\n…";
 
-function makeEditor(side) {
+let personaDrafts = {};
+
+function currentPeople() {
+  return parseInt($("people").value, 10) || BOOT.defaultPeople;
+}
+
+function slotLabel(slot) {
+  return slot === 1
+    ? "第 1 位 · 主提出方（开场）"
+    : "第 " + slot + " 位 · 回应者";
+}
+
+function makeEditor(slot) {
   function textInput(cls, ph, max) {
     const i = document.createElement("input");
     i.type = "text"; i.className = cls; i.placeholder = ph; i.maxLength = max;
@@ -1214,10 +1383,10 @@ function makeEditor(side) {
 
   const box = document.createElement("div");
   box.className = "editor";
-  box.dataset.side = side.key;
+  box.dataset.slot = String(slot);
 
   const head = document.createElement("div");
-  head.className = "ehead"; head.textContent = side.label;
+  head.className = "ehead"; head.textContent = slotLabel(slot);
   box.appendChild(head);
 
   const row = document.createElement("div");
@@ -1243,7 +1412,7 @@ function makeEditor(side) {
   const hint = document.createElement("textarea");
   hint.className = "e-hint-text";
   hint.maxLength = BOOT.maxPersonaHint;
-  hint.placeholder = side.hint;
+  hint.placeholder = SLOT_HINTS[(slot - 1) % SLOT_HINTS.length];
   const hintCount = document.createElement("div");
   hintCount.className = "ecount";
   hintBox.appendChild(hintLabel); hintBox.appendChild(hint); hintBox.appendChild(hintCount);
@@ -1253,10 +1422,11 @@ function makeEditor(side) {
   manualBox.className = "e-manual hidden";
   const grid = document.createElement("div");
   grid.className = "grid";
+  const role = textInput("e-role", "角色名（可选，≤" + BOOT.maxRole + " 字）", BOOT.maxRole);
   const name = textInput("e-name", "称呼（≤" + BOOT.maxName + " 字）", BOOT.maxName);
   const title = textInput("e-title", "身份（≤" + BOOT.maxPersonaTitle + " 字）", BOOT.maxPersonaTitle);
   const stance = textInput("e-stance", "负责什么（≤" + BOOT.maxStance + " 字）", BOOT.maxStance);
-  grid.appendChild(name); grid.appendChild(title); grid.appendChild(stance);
+  grid.appendChild(role); grid.appendChild(name); grid.appendChild(title); grid.appendChild(stance);
   manualBox.appendChild(grid);
   const msgLabel = document.createElement("label");
   msgLabel.textContent = "人格设定（三块；可再加「长期背景与案例」）";
@@ -1277,12 +1447,16 @@ function makeEditor(side) {
     const n = msg.value.trim().length;
     msgCount.textContent = n + " / " + BOOT.maxManualSystemMessage;
     msgCount.className = "ecount" + (n > BOOT.maxManualSystemMessage ? " over" : "");
-    savePersonaDrafts();
   }
-  mode.onchange = refresh;
-  [hint, msg, name, title, stance].forEach((el) => el.addEventListener("input", refresh));
+  function touch() {
+    refresh();
+    savePersonaDrafts();
+    updateForgeHint();
+  }
+  mode.onchange = touch;
+  [hint, msg, role, name, title, stance].forEach((el) => el.addEventListener("input", touch));
   box._refresh = refresh;
-  box._fields = { mode, hint, name, title, stance, msg };
+  box._fields = { mode, hint, role, name, title, stance, msg };
   return box;
 }
 
@@ -1291,6 +1465,7 @@ function readEditor(box) {
   return {
     mode: f.mode.value,
     hint: f.hint.value,
+    role: f.role.value,
     name: f.name.value,
     title: f.title.value,
     stance: f.stance.value,
@@ -1302,6 +1477,7 @@ function writeEditor(box, data) {
   const f = box._fields;
   f.mode.value = data.mode || "auto";
   f.hint.value = data.hint || "";
+  f.role.value = data.role || "";
   f.name.value = data.name || "";
   f.title.value = data.title || "";
   f.stance.value = data.stance || "";
@@ -1312,47 +1488,239 @@ function writeEditor(box, data) {
 function collectAllEditors() {
   const out = {};
   document.querySelectorAll("#personaEditors .editor").forEach((box) => {
-    out[box.dataset.side] = readEditor(box);
+    out[box.dataset.slot] = readEditor(box);
   });
   return out;
 }
 
 function collectPersonas() {
-  const out = {};
-  for (const [side, d] of Object.entries(collectAllEditors())) {
+  savePersonaDrafts();
+  const out = [];
+  for (let slot = 1; slot <= currentPeople(); slot++) {
+    const d = personaDrafts[slot] || { mode: "auto" };
     if (d.mode === "hint") {
-      out[side] = { mode: "hint", hint: d.hint.trim() };
+      out.push({ mode: "hint", hint: (d.hint || "").trim() });
     } else if (d.mode === "manual") {
-      out[side] = {
+      out.push({
         mode: "manual",
-        name: d.name.trim(), title: d.title.trim(),
-        stance: d.stance.trim(), system_message: d.system_message.trim(),
-      };
+        role: (d.role || "").trim(),
+        name: (d.name || "").trim(),
+        title: (d.title || "").trim(),
+        stance: (d.stance || "").trim(),
+        system_message: (d.system_message || "").trim(),
+      });
+    } else {
+      out.push({});
     }
   }
   return out;
 }
 
 function savePersonaDrafts() {
+  // 只覆盖当前可见的位置；减少人数时，被隐藏位置的草稿仍留在 personaDrafts 里。
+  Object.assign(personaDrafts, collectAllEditors());
   try {
-    localStorage.setItem(PERSONA_STORE, JSON.stringify(collectAllEditors()));
+    localStorage.setItem(PERSONA_STORE, JSON.stringify(personaDrafts));
   } catch (e) { /* 隐私模式等，忽略 */ }
 }
 
-function restorePersonaDrafts() {
-  let saved = {};
-  try { saved = JSON.parse(localStorage.getItem(PERSONA_STORE) || "{}"); }
-  catch (e) { saved = {}; }
+function loadPersonaDrafts() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(PERSONA_STORE) || "{}") || {};
+    // 兼容旧版按 proposer / challenger 两个侧存的草稿。
+    if (saved.proposer) { saved["1"] = saved.proposer; delete saved.proposer; }
+    if (saved.challenger) { saved["2"] = saved.challenger; delete saved.challenger; }
+    personaDrafts = saved;
+  } catch (e) { personaDrafts = {}; }
+}
+
+function applyPersonaDrafts() {
   document.querySelectorAll("#personaEditors .editor").forEach((box) => {
-    if (saved[box.dataset.side]) { writeEditor(box, saved[box.dataset.side]); }
+    const data = personaDrafts[box.dataset.slot];
+    if (data) { writeEditor(box, data); } else { box._refresh(); }
   });
 }
 
-const editors = $("personaEditors");
-for (const side of SIDES) { editors.appendChild(makeEditor(side)); }
+function rebuildEditors() {
+  savePersonaDrafts();   // 先把当前可见位置的输入收起来
+  const host = $("personaEditors");
+  host.innerHTML = "";
+  for (let slot = 1; slot <= currentPeople(); slot++) {
+    host.appendChild(makeEditor(slot));
+  }
+  applyPersonaDrafts();
+  updateForgeHint();
+}
+
+function updateForgeHint() {
+  const n = currentPeople();
+  savePersonaDrafts();
+  let allManual = true;
+  for (let slot = 1; slot <= n; slot++) {
+    if ((personaDrafts[slot] || {}).mode !== "manual") { allManual = false; break; }
+  }
+  const base = allManual ? 1 : (n === 2 ? 2 : 3);
+  const calls = base + (materialQueued ? 1 : 0);
+  const stages = (materialQueued ? "材料提炼 + " : "")
+    + (allManual ? "议题" : (n === 2 ? "人格 + 议题" : "团队骨架 + 人格 + 议题"));
+  $("forgeHint").textContent =
+    "正常调用模型 " + calls + " 次（" + stages + "）；格式不对会自动重试。" +
+    "模拟模式不联网、不花钱，产出是占位内容。";
+}
+
+function updateTeamHintCount() {
+  const n = $("teamHint").value.trim().length;
+  $("teamHintCount").textContent = n + " / " + BOOT.maxTeamHint;
+  $("teamHintCount").style.color = n > BOOT.maxTeamHint ? "var(--bad)" : "";
+}
+
+// ---- 拖入 .md / .txt 材料 ----
+
+function isTextFile(name) {
+  return /\.(md|markdown|txt)$/i.test(name || "");
+}
+
+function showMaterialFiles(files, state) {
+  $("materialBox").classList.remove("hidden");
+  $("materialFiles").textContent =
+    (files && files.length) ? files.join("、") : "拖入的材料";
+  $("materialMeta").textContent = state || "";
+  $("materialDetails").classList.add("hidden");
+}
+
+function showMaterial(material, files) {
+  $("materialBox").classList.remove("hidden");
+  $("materialFiles").textContent = files.join("、");
+  $("materialMeta").textContent = "已读入 " + material.length + " 字";
+  $("materialPreview").textContent = material.slice(0, 1200);
+  $("materialDetails").classList.remove("hidden");
+}
+
+async function handleFiles(fileList) {
+  if (running) {
+    notice("已经有一轮在跑了，等它结束。", "bad");
+    return;
+  }
+  const files = [...(fileList || [])];
+  if (!files.length) { return; }
+  if (files.length > BOOT.maxMaterialFiles) {
+    notice("一次最多 " + BOOT.maxMaterialFiles + " 个文件，收到 " + files.length + " 个。", "bad");
+    return;
+  }
+  const bad = files.filter((f) => !isTextFile(f.name));
+  if (bad.length) {
+    notice("只支持 .md / .markdown / .txt：" + bad.map((f) => f.name).join("、"), "bad");
+    return;
+  }
+  const tooBig = files.filter((f) => f.size > 512 * 1024);
+  if (tooBig.length) {
+    notice("文件太大（单份上限 512 KB）：" + tooBig.map((f) => f.name).join("、"), "bad");
+    return;
+  }
+
+  const parts = [];
+  for (const f of files) {
+    let text;
+    try {
+      text = await f.text();
+    } catch (e) {
+      notice("读不出文件：" + f.name, "bad");
+      return;
+    }
+    text = text.replace(/^﻿/, "").replace(/\r\n/g, "\n").trim();
+    if (!text) {
+      notice("文件是空的：" + f.name, "bad");
+      return;
+    }
+    if (text.indexOf("�") >= 0) {
+      notice("文件可能不是 UTF-8 编码（读到乱码）：" + f.name, "bad");
+      return;
+    }
+    if (text.indexOf("\u0000") >= 0) {
+      notice("看起来不是文本文件：" + f.name, "bad");
+      return;
+    }
+    parts.push("## 文件：" + f.name + "\n\n" + text);
+  }
+  const material = parts.join("\n\n---\n\n");
+  if (material.length > BOOT.maxMaterial) {
+    notice(
+      "材料太长（" + material.length + " 字），上限 " + BOOT.maxMaterial
+      + " 字；请先精简，或者拆成几次。",
+      "bad"
+    );
+    return;
+  }
+
+  pendingMaterial = material;
+  pendingFiles = files.map((f) => f.name);
+  showMaterial(pendingMaterial, pendingFiles);
+  notice("已读入 " + pendingFiles.length + " 份材料，正在提炼目的并锻造蓝图……", "");
+  await startForge({ material: pendingMaterial, files: pendingFiles });
+}
+
+const dropZone = $("step1");
+let dragDepth = 0;
+window.addEventListener("dragover", (e) => e.preventDefault());
+window.addEventListener("drop", (e) => e.preventDefault());
+dropZone.addEventListener("dragenter", (e) => {
+  e.preventDefault();
+  if (running) { return; }
+  dragDepth += 1;
+  dropZone.classList.add("dragging");
+});
+dropZone.addEventListener("dragover", (e) => e.preventDefault());
+dropZone.addEventListener("dragleave", (e) => {
+  e.preventDefault();
+  dragDepth = Math.max(0, dragDepth - 1);
+  if (dragDepth === 0) { dropZone.classList.remove("dragging"); }
+});
+dropZone.addEventListener("drop", (e) => {
+  e.preventDefault();
+  dragDepth = 0;
+  dropZone.classList.remove("dragging");
+  handleFiles(e.dataTransfer && e.dataTransfer.files);
+});
+$("pickFiles").onclick = () => { if (!running) { $("fileInput").click(); } };
+$("fileInput").onchange = () => {
+  handleFiles($("fileInput").files);
+  $("fileInput").value = "";
+};
+
+function saveTeamDraft() {
+  try {
+    localStorage.setItem(TEAM_STORE, JSON.stringify({
+      people: currentPeople(),
+      teamHint: $("teamHint").value,
+    }));
+  } catch (e) { /* 隐私模式等，忽略 */ }
+}
+
+function loadTeamDraft() {
+  try {
+    const d = JSON.parse(localStorage.getItem(TEAM_STORE) || "{}") || {};
+    if (d.teamHint) { $("teamHint").value = d.teamHint; }
+    if (Number.isInteger(d.people)) {
+      const n = Math.max(BOOT.minPeople, Math.min(BOOT.maxPeople, d.people));
+      $("people").value = String(n);
+    }
+  } catch (e) { /* 忽略 */ }
+}
+
 $("manualLimit").textContent = String(BOOT.maxManualSystemMessage);
-restorePersonaDrafts();
-document.querySelectorAll("#personaEditors .editor").forEach((box) => box._refresh());
+$("teamHint").maxLength = BOOT.maxTeamHint;
+loadPersonaDrafts();
+loadTeamDraft();
+rebuildEditors();
+updateTeamHintCount();
+$("teamHint").addEventListener("input", () => {
+  updateTeamHintCount();
+  saveTeamDraft();
+});
+$("people").onchange = () => {
+  rebuildEditors();
+  saveTeamDraft();
+};
 
 // ---- 状态与提示 ----
 function setStatus(text, tone) {
@@ -1369,7 +1737,8 @@ function notice(text, tone) {
   $("notice").textContent = text || "";
 }
 const LOCKED_WHILE_RUNNING = [
-  "forgeBtn", "purpose", "title", "topicCount", "forgeMock",
+  "forgeBtn", "purpose", "title", "people", "teamHint", "topicCount", "forgeMock",
+  "pickFiles", "fileInput",
   "runBtn", "rounds", "converge", "runMock",
 ];
 function setRunning(on) {
@@ -1403,8 +1772,8 @@ function etaText(elapsedSec) {
 function updateCounter() {
   $("counter").textContent = turnsTotal ? "发言 " + turnsDone + "/" + turnsTotal : "";
 }
-function beginRun(total, rounds) {
-  turnsTotal = total * (1 + rounds * 2);
+function beginRun(total, rounds, people) {
+  turnsTotal = total * (1 + rounds * (people || 2));
   turnsDone = 0;
   startedAt = Date.now();
   clearInterval(timerId);
@@ -1433,10 +1802,10 @@ function appendTurn(ev) {
   const empty = $("empty");
   if (empty) { empty.remove(); }
   const el = document.createElement("div");
-  el.className = "msg " + (ev.side || "a");
+  el.className = "msg " + (ev.side || "s0");
   const s = document.createElement("span");
   s.className = "src";
-  s.textContent = ev.speaker + (ev.side === "b" ? " · 挑战者" : " · 方案方");
+  s.textContent = ev.speaker + (ev.role ? " · " + ev.role : "");
   el.appendChild(s);
   el.appendChild(document.createTextNode(ev.text));
   const chat = $("chat");
@@ -1449,8 +1818,15 @@ function appendTurn(ev) {
 function renderBlueprint(payload) {
   bp = payload;
   $("step2").classList.remove("hidden");
+  // 材料锻造时目的/标题是模型提炼出来的；这里回填，刷新页面后也看得到。
+  if (payload.purpose && payload.purpose.text) {
+    $("purpose").value = payload.purpose.text;
+    updatePurposeCount();
+  }
+  if (payload.title) { $("title").value = payload.title; }
   $("bpMeta").textContent =
-    payload.title + " · " + payload.slug + (payload.origin === "mock" ? " · 模拟生成" : "");
+    payload.title + " · " + payload.people + " 位 · " + payload.slug
+    + (payload.origin === "mock" ? " · 模拟生成" : "");
 
   const host = $("personas");
   host.innerHTML = "";
@@ -1458,9 +1834,11 @@ function renderBlueprint(payload) {
     const box = document.createElement("div");
     box.className = "persona";
     const nm = document.createElement("div");
-    nm.className = "nm"; nm.textContent = p.name;
+    nm.className = "nm";
+    nm.textContent = p.name + (p.role && p.role !== p.position ? " · " + p.role : "");
     const tt = document.createElement("div");
-    tt.className = "tt"; tt.textContent = p.title + " · 负责「" + p.stance + "」";
+    tt.className = "tt";
+    tt.textContent = p.title + " · " + (p.position || "参与者") + " · 负责「" + p.stance + "」";
     const det = document.createElement("details");
     const sum = document.createElement("summary");
     sum.textContent = "看他拿到的完整 system message";
@@ -1477,6 +1855,7 @@ function renderBlueprint(payload) {
     const lab = document.createElement("label");
     const cb = document.createElement("input");
     cb.type = "checkbox"; cb.checked = true; cb.dataset.key = t.key;
+    cb.onchange = updateRunHint;
     lab.appendChild(cb);
     lab.appendChild(document.createTextNode(t.section_title));
     lab.title = t.brief;
@@ -1509,12 +1888,13 @@ function selectedKeys() {
 function updateRunHint() {
   const on = $("runMock").checked;
   const n = selectedKeys().length;
+  const people = bp && bp.people ? bp.people : 2;
   $("runHint").className = on ? "hint" : "hint cost";
   $("runHint").textContent = on
     ? "模拟模式：不调用模型、不联网、不花钱。产出是占位内容，仅用来验证流程。"
     : "真实模式：调用模型，按用量计费，而且慢——最多 " + n + " 个正文议题 × "
-      + $("rounds").value + " 轮，每轮两次发言、每个议题一次整理，最后再压一次速查。"
-      + "轮数是上限：挑战者提不出新反对意见的议题会提前收手。";
+      + $("rounds").value + " 轮，每轮 " + people + " 次发言、每个议题一次整理，最后再压一次速查。"
+      + "轮数是上限：所有回应者都提不出新反对意见的议题会提前收手。";
 }
 
 // ---- markdown：只覆盖 digest.py / blueprint.py 实际产出的语法 ----
@@ -1620,12 +2000,45 @@ function handle(ev) {
     clearInterval(timerId);
     timerId = setInterval(tickElapsed, 1000);
     tickElapsed();
-    setActivity("准备调用模型", true);
-    setStatus("锻造中", "live");
+    setActivity(ev.material ? "正在读取材料" : "准备调用模型", true);
+    setStatus(ev.material ? "读材料中" : "锻造中", "live");
+    materialQueued = !!ev.material;
+    updateForgeHint();
+    if (ev.material) {
+      if (ev.files && ev.files.length) { showMaterialFiles(ev.files, "正在提炼目的"); }
+    } else {
+      // 手动锻造没有用材料，把上一份材料的展示收起来，别让人以为这次也用了。
+      $("materialBox").classList.add("hidden");
+      pendingMaterial = "";
+      pendingFiles = [];
+    }
     pickTab("chat");
   } else if (ev.type === "forge_stage") {
-    setActivity(ev.stage === "personas" ? "正在设计两位专家" : "正在设计议题", true);
+    const text = ev.stage === "distill"
+      ? "正在读材料、提炼目的"
+      : ev.stage === "personas"
+        ? "正在设计专家团队"
+        : "正在设计议题";
+    setActivity(text, true);
+    if (ev.stage === "distill") { setStatus("提炼目的中", "live"); }
+  } else if (ev.type === "material_distilled") {
+    $("purpose").value = ev.purpose || "";
+    $("title").value = ev.title || "";
+    updatePurposeCount();
+    if (pendingMaterial) {
+      showMaterial(pendingMaterial, pendingFiles);
+      $("materialMeta").textContent = "已提炼 · 正在锻造";
+    } else if (ev.files && ev.files.length) {
+      showMaterialFiles(ev.files, "已提炼 · 正在锻造");
+    }
+    setActivity("已提炼出目的，正在锻造蓝图", true);
+    notice("已从 " + (ev.files || []).length + " 份材料提炼出目的和标题。", "");
   } else if (ev.type === "forge_done") {
+    materialQueued = false;
+    updateForgeHint();
+    if (!$("materialBox").classList.contains("hidden")) {
+      $("materialMeta").textContent = "已提炼";
+    }
     renderBlueprint(ev.blueprint);
     setActivity("蓝图已生成");
     setStatus("蓝图就绪", "");
@@ -1638,6 +2051,8 @@ function handle(ev) {
     );
     endRun();
   } else if (ev.type === "forge_cancelled") {
+    materialQueued = false;
+    updateForgeHint();
     notice(ev.text || "已取消。", "warn");
     setActivity("已取消");
     setStatus("已取消", "warn");
@@ -1651,7 +2066,7 @@ function handle(ev) {
     hbRaw = ""; quickRaw = ""; trRaw = "";
     notice("");
     $("progress").textContent = "";
-    beginRun(ev.total, ev.rounds);
+    beginRun(ev.total, ev.rounds, ev.people || 2);
     setActivity("准备中", true);
     setStatus("运行中", "live");
     pickTab("chat");
@@ -1663,7 +2078,11 @@ function handle(ev) {
     setStatus("对谈中", "live");
   } else if (ev.type === "topic_done") {
     if (ev.early) {
-      $("progress").textContent += "　→ 挑战者已无新意见，第 " + ev.roundsRun + " 轮收手";
+      const who = (ev.conceding && ev.conceding.length)
+        ? ev.conceding.join("、")
+        : "所有回应者";
+      $("progress").textContent +=
+        "　→ " + who + " 已无新意见，第 " + ev.roundsRun + " 轮收手";
     }
   } else if (ev.type === "turn") {
     appendTurn(ev);
@@ -1681,6 +2100,13 @@ function handle(ev) {
     setStatus("压缩中", "live");
     $("progress").textContent += "　→ 正在生成一页速查";
   } else if (ev.type === "notice") {
+    if (ev.job === "forge") {
+      materialQueued = false;
+      updateForgeHint();
+      if (!$("materialBox").classList.contains("hidden")) {
+        $("materialMeta").textContent = "本次锻造未完成";
+      }
+    }
     notice(ev.text, ev.kind === "warning" ? "bad" : "warn");
     if (ev.kind === "warning") { setStatus("出错了", "bad"); }
     setActivity("");
@@ -1714,17 +2140,32 @@ async function post(path, body) {
 }
 
 // ---- 按钮 ----
-$("forgeBtn").onclick = async () => {
-  const purpose = $("purpose").value.trim();
-  if (purpose.length < BOOT.minPurpose) {
-    notice("目的太短了：至少 " + BOOT.minPurpose + " 字，要说清「给谁、解决什么、要什么」。", "bad");
-    return;
+async function startForge(options = {}) {
+  const material = (options.material || "").trim();
+  const files = options.files || [];
+  let purpose = "";
+  let title = "";
+
+  if (material) {
+    if (material.length > BOOT.maxMaterial) {
+      notice("材料太长（" + material.length + " 字），上限 " + BOOT.maxMaterial + " 字。", "bad");
+      return;
+    }
+  } else {
+    purpose = $("purpose").value.trim();
+    if (purpose.length < BOOT.minPurpose) {
+      notice("目的太短了：至少 " + BOOT.minPurpose + " 字，要说清「给谁、解决什么、要什么」。", "bad");
+      return;
+    }
+    title = $("title").value.trim();
   }
 
   // 前端先挡明显的漏填；权威校验在服务端（同一套 parse_persona_plan）。
+  const people = currentPeople();
   const personas = collectPersonas();
-  for (const [side, spec] of Object.entries(personas)) {
-    const label = side === "proposer" ? "第一位专家" : "第二位专家";
+  for (let i = 0; i < personas.length; i++) {
+    const spec = personas[i];
+    const label = "第 " + (i + 1) + " 位专家";
     if (spec.mode === "hint" && !spec.hint) {
       $("customBox").open = true;
       notice(label + "选了「给方向」，先写一两句方向。", "bad");
@@ -1740,21 +2181,31 @@ $("forgeBtn").onclick = async () => {
     }
   }
 
+  materialQueued = !!material;
+  updateForgeHint();
   setRunning(true);
-  setActivity("启动中", true);
+  setActivity(material ? "已收到材料，准备提炼目的" : "启动中", true);
   const res = await post("/forge", {
     purpose: purpose,
-    title: $("title").value.trim(),
+    title: title,
+    people: people,
+    teamHint: $("teamHint").value.trim(),
     topics: parseInt($("topicCount").value, 10),
     mock: $("forgeMock").checked,
     personas: personas,
+    material: material || undefined,
+    files: files.length ? files : undefined,
   });
   if (!res.ok) {
+    materialQueued = false;
+    updateForgeHint();
     setRunning(false);
     setActivity("");
     notice(res.why || "启动失败", "bad");
   }
-};
+}
+
+$("forgeBtn").onclick = () => startForge();
 
 $("runBtn").onclick = async () => {
   const keys = selectedKeys();
@@ -1791,8 +2242,8 @@ $("rounds").onchange = updateRunHint;
 function pickTab(which) {
   for (const w of ["chat", "bp", "out"]) {
     const on = w === which;
-    $("#tab-" + w).className = "tab" + (on ? " on" : "");
-    $("#pane-" + w).className = "pane" + (on ? " on" : "");
+    $("tab-" + w).className = "tab" + (on ? " on" : "");
+    $("pane-" + w).className = "pane" + (on ? " on" : "");
   }
 }
 $("tab-chat").onclick = () => pickTab("chat");
