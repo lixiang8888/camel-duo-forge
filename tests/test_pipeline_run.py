@@ -7,9 +7,10 @@ from __future__ import annotations
 
 import pytest
 
-from duo_forge import digest, pipeline
+from duo_forge import digest, pipeline, society
 from duo_forge.backends import ScriptedBackend
 from duo_forge.pipeline import PipelineHooks, RunStopped, run_pipeline
+from duo_forge.society import ConvergenceResult, Turn
 from duo_forge.topics import CLOSING_KEY
 
 from test_society import ConcedingBackend
@@ -253,3 +254,174 @@ def test_the_editor_is_told_the_team_size(blueprint3, tmp_path, monkeypatch):
     assert captured
     assert all(people == 3 for people in captured)
 
+
+# ---------------------------------------------------------------------------
+# 全部议题结束后的强制统一
+# ---------------------------------------------------------------------------
+
+
+def _stub_digest(monkeypatch, *, section_disagrees: bool, closing_disagrees: bool):
+    """让整理环节直接吐带标记的固定文本，把测点收窄到 pipeline 的判定。"""
+
+    def fake_section(topic, dialogue, *, backend, title, people=2):
+        marker = "【本节分歧：有】" if section_disagrees else "【本节分歧：无】"
+        return f"## {topic.section_title}\n正文\n{marker}"
+
+    def fake_closing(dialogue, *, backend, title):
+        marker = "【未解决分歧：有】" if closing_disagrees else "【未解决分歧：无】"
+        return f"## 附录 A · 分歧备忘\n内容\n{marker}"
+
+    monkeypatch.setattr(digest, "digest_section", fake_section)
+    monkeypatch.setattr(digest, "digest_closing", fake_closing)
+
+
+def _stub_convergence(monkeypatch, *, reservations=()):
+    calls: list[str] = []
+
+    def fake(*, personas, backend, context, on_turn=None):
+        calls.append(context)
+        result = ConvergenceResult(
+            turns=[
+                Turn(speaker="老张", content="统一轮表态", role="挑战者"),
+                Turn(speaker="康复师", content="统一结论：定稿。", role="主提出方"),
+            ],
+            unified="统一结论：按原方案定稿，成本条款另算。",
+            reservations=tuple(reservations),
+        )
+        if on_turn:
+            for turn in result.turns:
+                on_turn(turn)
+        return result
+
+    monkeypatch.setattr(society, "converge_history", fake)
+    return calls
+
+
+def test_unification_runs_when_the_final_output_still_has_disagreements(
+    blueprint, tmp_path, monkeypatch
+):
+    _stub_digest(monkeypatch, section_disagrees=False, closing_disagrees=True)
+    calls = _stub_convergence(monkeypatch, reservations=(("老张", "成本没人算。"),))
+
+    result = run_pipeline(
+        blueprint=blueprint,
+        backend=ScriptedBackend(),
+        rounds=1,
+        out_dir=tmp_path,
+        mock=False,
+        converge=True,
+    )
+
+    assert calls, "收尾附录标着「有」，必须触发统一轮"
+    assert "## 附录 D · 最终统一意见" in result.handbook
+    assert "统一结论：按原方案定稿" in result.handbook
+    assert "成本没人算。" in result.handbook
+    assert "最终统一意见（全部议题结束后）" in result.transcript
+    # 标记是给代码看的，成品里不能留。
+    assert "【未解决分歧：有】" not in result.handbook
+
+
+def test_unification_is_skipped_when_every_section_is_marked_consistent(
+    blueprint, tmp_path, monkeypatch
+):
+    _stub_digest(monkeypatch, section_disagrees=False, closing_disagrees=False)
+
+    def boom(**kwargs):
+        raise AssertionError("没有分歧时不该跑统一轮")
+
+    monkeypatch.setattr(society, "converge_history", boom)
+
+    result = run_pipeline(
+        blueprint=blueprint,
+        backend=ScriptedBackend(),
+        rounds=1,
+        out_dir=tmp_path,
+        mock=False,
+        converge=True,
+    )
+
+    assert result.convergence == ""
+    assert "附录 D" not in result.handbook
+
+
+def test_unification_respects_the_converge_switch(blueprint, tmp_path, monkeypatch):
+    _stub_digest(monkeypatch, section_disagrees=True, closing_disagrees=True)
+
+    def boom(**kwargs):
+        raise AssertionError("--no-converge 时不该跑统一轮")
+
+    monkeypatch.setattr(society, "converge_history", boom)
+
+    result = run_pipeline(
+        blueprint=blueprint,
+        backend=ScriptedBackend(),
+        rounds=1,
+        out_dir=tmp_path,
+        mock=False,
+        converge=False,
+    )
+
+    assert result.convergence == ""
+
+
+def test_mock_never_runs_unification(blueprint, tmp_path, monkeypatch):
+    """mock 的职责是证明链路跑通，不做真实收敛判断，也不多花调用。"""
+    _stub_digest(monkeypatch, section_disagrees=True, closing_disagrees=True)
+
+    def boom(**kwargs):
+        raise AssertionError("mock 下不该跑统一轮")
+
+    monkeypatch.setattr(society, "converge_history", boom)
+
+    result = _run(blueprint, tmp_path)
+
+    assert result.convergence == ""
+    assert "附录 D" not in result.handbook
+
+
+def test_the_unification_turns_go_through_the_turn_hook(
+    blueprint, tmp_path, monkeypatch
+):
+    _stub_digest(monkeypatch, section_disagrees=True, closing_disagrees=True)
+    _stub_convergence(monkeypatch)
+    topics_seen: list[str] = []
+    hooks = PipelineHooks(on_turn=lambda topic, turn: topics_seen.append(topic.key))
+
+    run_pipeline(
+        blueprint=blueprint,
+        backend=ScriptedBackend(),
+        rounds=1,
+        out_dir=tmp_path,
+        mock=False,
+        converge=True,
+        hooks=hooks,
+    )
+
+    assert "convergence" in topics_seen
+
+
+def test_unification_is_dropped_when_stopped(blueprint, tmp_path, monkeypatch):
+    """统一轮跑完才点停止也一样：这一轮作废，一个文件都不写。"""
+    _stub_digest(monkeypatch, section_disagrees=True, closing_disagrees=True)
+    _stub_convergence(monkeypatch)
+
+    checks = {"count": 0}
+
+    def should_stop() -> bool:
+        # 每个议题有 3 个检查点（开始前、对谈每轮、结束后）；放行它们，
+        # 拦住统一轮开始前的那一次。
+        checks["count"] += 1
+        return checks["count"] > len(blueprint.all_topics()) * 3
+
+    with pytest.raises(RunStopped):
+        run_pipeline(
+            blueprint=blueprint,
+            backend=ScriptedBackend(),
+            rounds=1,
+            out_dir=tmp_path,
+            mock=False,
+            converge=True,
+            should_stop=should_stop,
+        )
+
+    assert list(tmp_path.iterdir()) == []
