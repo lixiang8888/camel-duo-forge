@@ -34,7 +34,7 @@ from .personas import (
     full_system_message,
 )
 from .purpose import Purpose
-from .topics import CLOSING_KEY, Topic, closing_topic
+from .topics import CLOSING_KEY, CONVERGENCE_KEY, Topic, closing_topic
 
 #: 蓝图文件的格式版本。format 2 起 personas 支持 2–5 位并带 role。
 FORMAT = 2
@@ -377,10 +377,10 @@ def _topic(raw: object, source: str, index: int) -> Topic:
         raise BlueprintError(f"{source} 的第 {index} 个议题不是 JSON 对象。")
     where = f"第 {index} 个议题"
     key = _text(raw, "key", source, where=where)
-    if key == CLOSING_KEY:
+    if key in (CLOSING_KEY, CONVERGENCE_KEY):
         raise BlueprintError(
-            f"{source} 的第 {index} 个议题用了保留的 key「{CLOSING_KEY}」"
-            "——收尾议题由代码生成，蓝图里不要放。"
+            f"{source} 的第 {index} 个议题用了保留的 key「{key}」"
+            "——收尾议题和最终统一轮由代码生成，蓝图里不要放。"
         )
     return Topic(
         key=key,
