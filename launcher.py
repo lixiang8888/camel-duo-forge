@@ -100,6 +100,7 @@ from duo_forge.purpose import (
 )
 from duo_forge.topics import (
     CLOSING_KEY,
+    CONVERGENCE_KEY,
     DEFAULT_TOPIC_COUNT,
     MAX_TOPICS,
     closing_topic,
@@ -460,6 +461,20 @@ class _RunJob(_Job):
         def quick_start() -> None:
             emit("quick_start")
 
+        def converge_start() -> None:
+            emit(
+                "converge_start",
+                title="最终统一意见（全部议题已结束）",
+                people=len(personas),
+            )
+
+        def converge_done(result) -> None:
+            emit(
+                "converge_done",
+                allConceded=result.all_conceded,
+                reservations=[name for name, _ in result.reservations],
+            )
+
         return pipeline.PipelineHooks(
             on_run_start=run_start,
             on_topic_start=topic_start,
@@ -468,6 +483,8 @@ class _RunJob(_Job):
             on_section_start=section_start,
             on_section_done=section_done,
             on_quick_start=quick_start,
+            on_unify_start=converge_start,
+            on_unify_done=converge_done,
         )
 
     def _worker(self) -> None:
@@ -816,7 +833,7 @@ class _Handler(BaseHTTPRequestHandler):
         for raw_key in body.get("keys") or []:
             key = str(raw_key).strip()
             # 前端可能把固定勾选的收尾议题也带上；它不是蓝图里的正文议题。
-            if not key or key == CLOSING_KEY or key in seen:
+            if not key or key in (CLOSING_KEY, CONVERGENCE_KEY) or key in seen:
                 continue
             seen.add(key)
             keys.append(key)
@@ -1255,8 +1272,8 @@ _PAGE = r"""<!DOCTYPE html>
       <span style="font-size:13px">每个议题最多</span>
       <select id="rounds"></select>
       <label style="font-size:13px;display:flex;align-items:center;gap:5px;cursor:pointer"
-             title="所有回应者都提不出新的反对意见时，这个议题就到此为止，不再跑满上面的轮数">
-        <input type="checkbox" id="converge" checked> 谈拢了就收手
+             title="所有回应者都提不出新的反对意见时提前收手；全部议题结束后，如果成果里仍有未统一的分歧，会再补一轮强制统一">
+        <input type="checkbox" id="converge" checked> 谈拢了就收手，最后强制统一
       </label>
       <label style="font-size:13px;display:flex;align-items:center;gap:5px;cursor:pointer">
         <input type="checkbox" id="runMock"> 模拟模式（不花钱）
@@ -1772,8 +1789,10 @@ function etaText(elapsedSec) {
 function updateCounter() {
   $("counter").textContent = turnsTotal ? "发言 " + turnsDone + "/" + turnsTotal : "";
 }
-function beginRun(total, rounds, people) {
-  turnsTotal = total * (1 + rounds * (people || 2));
+function beginRun(total, rounds, people, unify) {
+  // 全部议题结束后还可能补一轮统一，按上限算进去；实际可能不跑。
+  const n = people || 2;
+  turnsTotal = total * (1 + rounds * n) + (unify ? n : 0);
   turnsDone = 0;
   startedAt = Date.now();
   clearInterval(timerId);
@@ -1794,7 +1813,9 @@ function appendTopicHead(ev) {
   if (empty) { empty.remove(); }
   const el = document.createElement("div");
   el.className = "topic-head";
-  el.textContent = "[" + ev.index + "/" + ev.total + "] " + ev.title;
+  el.textContent = (ev.index && ev.total)
+    ? "[" + ev.index + "/" + ev.total + "] " + ev.title
+    : ev.title;
   $("chat").appendChild(el);
   $("chat").scrollTop = $("chat").scrollHeight;
 }
@@ -1887,6 +1908,7 @@ function selectedKeys() {
 
 function updateRunHint() {
   const on = $("runMock").checked;
+  const converge = $("converge").checked;
   const n = selectedKeys().length;
   const people = bp && bp.people ? bp.people : 2;
   $("runHint").className = on ? "hint" : "hint cost";
@@ -1894,7 +1916,10 @@ function updateRunHint() {
     ? "模拟模式：不调用模型、不联网、不花钱。产出是占位内容，仅用来验证流程。"
     : "真实模式：调用模型，按用量计费，而且慢——最多 " + n + " 个正文议题 × "
       + $("rounds").value + " 轮，每轮 " + people + " 次发言、每个议题一次整理，最后再压一次速查。"
-      + "轮数是上限：所有回应者都提不出新反对意见的议题会提前收手。";
+      + (converge
+        ? "轮数是上限：所有回应者都提不出新反对意见的议题会提前收手；"
+          + "全部议题结束后若仍有分歧，会再补一轮（最多 " + people + " 次发言）强制统一。"
+        : "已关闭收敛：每个议题跑满轮数，结束后也不做最终统一。");
 }
 
 // ---- markdown：只覆盖 digest.py / blueprint.py 实际产出的语法 ----
@@ -2066,7 +2091,7 @@ function handle(ev) {
     hbRaw = ""; quickRaw = ""; trRaw = "";
     notice("");
     $("progress").textContent = "";
-    beginRun(ev.total, ev.rounds, ev.people || 2);
+    beginRun(ev.total, ev.rounds, ev.people || 2, ev.converge);
     setActivity("准备中", true);
     setStatus("运行中", "live");
     pickTab("chat");
@@ -2095,6 +2120,19 @@ function handle(ev) {
     $("progress").textContent += ev.closing ? "　→ 整理附录中" : "　→ 整理成章节中";
   } else if (ev.type === "section_done") {
     setActivity("已整理好一节", true);
+  } else if (ev.type === "converge_start") {
+    appendTopicHead({ title: ev.title || "最终统一意见（全部议题已结束）" });
+    setActivity("成果里仍有未统一的分歧，正在做最后一轮强制统一", true);
+    setStatus("统一意见中", "live");
+    $("progress").textContent += "　→ 正在做最终统一";
+  } else if (ev.type === "converge_done") {
+    setActivity("最终统一轮结束", true);
+    if (ev.allConceded) {
+      $("progress").textContent += "　→ 所有回应者都接受统一结论";
+    } else {
+      const who = (ev.reservations || []).join("、") || "部分回应者";
+      $("progress").textContent += "　→ " + who + " 仍保留意见（附录 D）";
+    }
   } else if (ev.type === "quick_start") {
     setActivity("正在把整份成果压成一页速查", true);
     setStatus("压缩中", "live");
@@ -2237,6 +2275,7 @@ $("stopBtn").onclick = async () => {
 
 $("runMock").onchange = updateRunHint;
 $("rounds").onchange = updateRunHint;
+$("converge").onchange = updateRunHint;
 
 // ---- Tab ----
 function pickTab(which) {
