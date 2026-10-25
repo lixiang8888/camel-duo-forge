@@ -100,7 +100,7 @@ def run_pipeline(
     所以喊停最坏要等当前这一轮对谈跑完（society.step() 内部是两次模型调用，
     没法从中间掐断）。
 
-    `converge` 决定「挑战者没有新的反对意见就提前收手」要不要开（`rounds` 因此
+    `converge` 决定「所有回应者都没有新的反对意见就提前收手」要不要开（`rounds` 因此
     是上限而非定额）。**mock 模式下恒关**，两个原因：ScriptedBackend 只吐固定
     模板、根本不会说那句话，开着也只是白费判断；更重要的是 mock 的职责就是
     证明「循环确实跑满了 N 轮」，让它在轮数上变来变去会让那条保证失效。
@@ -167,6 +167,7 @@ def run_pipeline(
                 dialogue,
                 backend=backend,
                 title=blueprint.title,
+                people=len(blueprint.personas),
             )
             sections.append(produced)
 
@@ -185,9 +186,7 @@ def run_pipeline(
     transcript_path = out / f"transcript-{stamp}{slug}{suffix}.md"
     handbook_path = out / f"handbook-{stamp}{slug}{suffix}.md"
 
-    head = digest.header(
-        blueprint.title, blueprint.proposer, blueprint.challenger
-    )
+    head = digest.header(blueprint.title, blueprint.personas)
     if mock:
         head = (
             "> ⚠️ **这是模拟模式生成的占位文件，不含任何真实内容。**\n\n"
