@@ -339,3 +339,132 @@ def test_show_reports_a_broken_blueprint(tmp_path, capsys):
 def test_no_subcommand_prints_help(capsys):
     assert main([]) == 1
     assert "forge" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# 多人
+# ---------------------------------------------------------------------------
+
+
+def test_forge_with_three_people(tmp_path, capsys):
+    assert _forge(tmp_path, "--people", "3") == 0
+
+    made = blueprint_mod.load(next(tmp_path.glob("*.json")))
+    assert made.people == 3
+    assert len(made.personas) == 3
+    out = capsys.readouterr().out
+    assert "对话人数：3 位" in out
+    assert "3 位专家" in out
+    assert "3 次模型调用" in out
+
+
+def test_forge_with_five_people(tmp_path):
+    assert _forge(tmp_path, "--people", "5") == 0
+    made = blueprint_mod.load(next(tmp_path.glob("*.json")))
+    assert made.people == 5
+    assert len({p.role for p in made.personas}) == 5
+
+
+def test_forge_rejects_an_out_of_range_people(tmp_path, capsys):
+    assert _forge(tmp_path, "--people", "6") == 2
+    assert "2–5" in capsys.readouterr().err
+
+
+def test_forge_accepts_a_team_hint(tmp_path):
+    assert (
+        _forge(tmp_path, "--people", "3", "--team-hint", "要有一个医生、一个患者、一个管理者")
+        == 0
+    )
+    made = blueprint_mod.load(next(tmp_path.glob("*.json")))
+    assert made.people == 3
+
+
+def test_load_persona_plan_applies_the_team_hint():
+    from duo_forge.cli import _load_persona_plan
+
+    plan = _load_persona_plan(None, people=3, team_hint="  要有一个医生  ")
+    assert plan.people == 3
+    assert plan.team_hint == "要有一个医生"
+
+
+def test_forge_accepts_a_personas_array(tmp_path):
+    out = tmp_path / "out"
+    path = _write_personas(
+        tmp_path,
+        {
+            "personas": [
+                _MANUAL_PERSONAS["proposer"],
+                {"mode": "hint", "hint": "一位带过很多程序员的实战派教练"},
+                {},
+            ]
+        },
+    )
+    assert (
+        main(
+            [
+                "forge", "--purpose", PURPOSE, "--mock",
+                "--out", str(out), "--personas-file", str(path),
+            ]
+        )
+        == 0
+    )
+    made = blueprint_mod.load(next(out.glob("*.json")))
+    assert made.people == 3
+    assert made.personas[0].name == "许医师"
+    assert made.personas[1].name == "挑刺方"
+
+
+def test_a_personas_array_can_be_shorter_than_people(tmp_path):
+    out = tmp_path / "out"
+    path = _write_personas(
+        tmp_path, {"personas": [_MANUAL_PERSONAS["proposer"]]}
+    )
+    assert (
+        main(
+            [
+                "forge", "--purpose", PURPOSE, "--mock",
+                "--out", str(out), "--personas-file", str(path),
+                "--people", "4",
+            ]
+        )
+        == 0
+    )
+    made = blueprint_mod.load(next(out.glob("*.json")))
+    assert made.people == 4
+    assert made.personas[0].name == "许医师"
+    assert made.personas[1].name == "挑刺方"
+
+
+def test_run_from_a_purpose_with_three_people(tmp_path):
+    out = tmp_path / "out"
+    assert (
+        main(
+            [
+                "run", "--purpose", PURPOSE, "--mock", "--rounds", "1",
+                "--people", "3", "--out", str(out),
+            ]
+        )
+        == 0
+    )
+    made = blueprint_mod.load(next(out.glob("*.json")))
+    assert made.people == 3
+
+
+def test_run_with_blueprint_and_people_is_refused(tmp_path, capsys):
+    _forge(tmp_path)
+    bp_path = next(tmp_path.glob("*.json"))
+    code = main(
+        ["run", "--blueprint", str(bp_path), "--people", "3", "--mock"]
+    )
+    assert code == 2
+    assert "--people" in capsys.readouterr().err
+
+
+def test_run_with_blueprint_and_team_hint_is_refused(tmp_path, capsys):
+    _forge(tmp_path)
+    bp_path = next(tmp_path.glob("*.json"))
+    code = main(
+        ["run", "--blueprint", str(bp_path), "--team-hint", "要有一个医生", "--mock"]
+    )
+    assert code == 2
+    assert "--team-hint" in capsys.readouterr().err
