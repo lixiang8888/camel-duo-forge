@@ -2,7 +2,7 @@
 
 三个子命令，对应流程的两段：
 
-    forge   目的 → 两位专家的人格 + 一组议题 → 蓝图（落盘，可读可改）
+    forge   目的 → 2–5 位专家的人格 + 一组议题 → 蓝图（落盘，可读可改）
     run     蓝图 → 对谈 → 整理 → 成果文件
     show    把一份蓝图摊开给人看（不调用模型）
 
@@ -26,7 +26,14 @@ from pathlib import Path
 from . import blueprint as blueprint_mod
 from .blueprint import Blueprint, BlueprintError
 from .config import BLUEPRINT_DIR, MissingApiKey, build_author_backend, build_backend
-from .personas import PersonaPlan, PersonaSpecError, parse_persona_plan
+from .personas import (
+    MAX_PEOPLE,
+    MIN_PEOPLE,
+    PersonaPlan,
+    PersonaSpecError,
+    parse_persona_plan,
+    parse_team_hint,
+)
 from .purpose import InvalidPurpose, Purpose, make_purpose, read_purpose_file
 from .topics import DEFAULT_TOPIC_COUNT
 
@@ -60,26 +67,46 @@ def _purpose_from_args(args: argparse.Namespace) -> Purpose:
 
 
 def _add_persona_args(parser: argparse.ArgumentParser) -> None:
-    group = parser.add_argument_group("自定义人格（可选）")
+    group = parser.add_argument_group("团队与自定义人格（可选）")
+    group.add_argument(
+        "--people", type=int, default=None,
+        help=f"对话人数 {MIN_PEOPLE}–{MAX_PEOPLE}（默认 2）；不给时按人格数组长度推断",
+    )
+    group.add_argument(
+        "--team-hint", default="",
+        help='团队级分工要求，例如 "要有一个一线医生、一个患者、一个管理者"',
+    )
     group.add_argument(
         "--personas-file", type=Path, default=None,
-        help="JSON 文件：可自定义一位或两位专家（mode=auto/hint/manual）。格式见 README",
+        help="JSON 文件：逐位自定义 2–5 位专家（mode=auto/hint/manual），也可写 team",
     )
 
 
-def _load_persona_plan(path: Path | None) -> PersonaPlan:
-    """读人格文件并校验。所有失败都包成 PersonaSpecError，消息能直接给人看。"""
-    if path is None:
-        return PersonaPlan()
-    try:
-        raw = json.loads(Path(path).read_text(encoding="utf-8"))
-    except OSError as exc:
-        raise PersonaSpecError(f"读不出人格文件 {path}：{exc}") from None
-    except json.JSONDecodeError as exc:
-        raise PersonaSpecError(
-            f"人格文件不是合法 JSON：{exc.msg}（第 {exc.lineno} 行）"
-        ) from None
-    return parse_persona_plan(raw)
+def _load_persona_plan(
+    path: Path | None, *, people: int | None = None, team_hint: str = ""
+) -> PersonaPlan:
+    """读人格文件并校验。所有失败都包成 PersonaSpecError，消息能直接给人看。
+
+    `team_hint` 是命令行显式给的团队要求：它覆盖文件里的 `team`。
+    """
+    raw: object = None
+    if path is not None:
+        try:
+            raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise PersonaSpecError(f"读不出人格文件 {path}：{exc}") from None
+        except json.JSONDecodeError as exc:
+            raise PersonaSpecError(
+                f"人格文件不是合法 JSON：{exc.msg}（第 {exc.lineno} 行）"
+            ) from None
+    plan = parse_persona_plan(raw, people=people)
+    if team_hint.strip():
+        plan = PersonaPlan(
+            specs=plan.specs,
+            team_hint=parse_team_hint(team_hint),
+            people=plan.people,
+        )
+    return plan
 
 
 def _fail(label: str, detail: object) -> int:
@@ -103,23 +130,29 @@ def _cmd_forge(args: argparse.Namespace) -> int:
 
     # 人格文件在任何付费调用之前解析完：写错一个字不该先花掉一次模型调用。
     try:
-        plan = _load_persona_plan(args.personas_file)
+        plan = _load_persona_plan(
+            args.personas_file, people=args.people, team_hint=args.team_hint
+        )
     except PersonaSpecError as exc:
         return _fail("人格设定有问题", exc)
 
     print(f"目的：{purpose.summary()}")
-    if plan.both_manual:
-        print(f"要生成：约 {args.topics} 个议题（两位专家由你提供，1 次模型调用）\n")
-    elif plan.has_manual:
-        print(f"要生成：另一位专家的人格 + 约 {args.topics} 个议题（2 次模型调用）\n")
+    print(f"对话人数：{plan.people} 位")
+    if plan.all_manual:
+        print(f"要生成：约 {args.topics} 个议题（{plan.people} 位专家都由你提供，1 次模型调用）\n")
+    elif plan.people == 2:
+        print(f"要生成：专家的人格 + 约 {args.topics} 个议题（2 次模型调用）\n")
     else:
-        print(f"要生成：两位专家的人格 + 约 {args.topics} 个议题（2 次模型调用）\n")
+        print(
+            f"要生成：团队分工骨架 + {plan.people} 位专家的人格 + 约 {args.topics} 个议题"
+            "（3 次模型调用）\n"
+        )
 
     if args.mock:
-        if plan.both_manual:
+        if plan.all_manual:
             print(
                 "!! 模拟模式：议题是占位内容，没有参考价值；"
-                "两位专家是你手写的，不受影响。\n"
+                "专家是你手写的，不受影响。\n"
             )
         else:
             print(
@@ -128,8 +161,11 @@ def _cmd_forge(args: argparse.Namespace) -> int:
 
     try:
         author = build_author_backend(mock=args.mock)
-        print("· 两位专家由你提供，跳过人格生成……" if plan.both_manual
-              else "· 正在设计两位专家……")
+        print(
+            "· 专家由你提供，跳过人格生成……"
+            if plan.all_manual
+            else "· 正在设计专家团队……"
+        )
         made = authoring.forge(
             purpose, backend=author, topic_count=args.topics, plan=plan
         )
@@ -146,18 +182,22 @@ def _save_and_report(made: Blueprint, out_dir: Path) -> int:
     json_path, md_path = made.save_bundle(out_dir)
 
     print(f"\n标题：{made.title}（slug: {made.slug}）")
-    print(
-        f"两位专家："
-        f"{made.proposer.name}（{made.proposer.title}）"
-        f" × "
-        f"{made.challenger.name}（{made.challenger.title}）"
-    )
+    heading = "两位专家" if made.people == 2 else f"{made.people} 位专家"
+    print(f"{heading}：")
+    for index, persona in enumerate(made.personas, 1):
+        position = "主提出方" if index == 1 else "回应者"
+        role = persona.display_role
+        extra = "" if role == position else f" · {role}"
+        print(
+            f"  第 {index} 位 · {position}{extra}："
+            f"{persona.name}（{persona.title}）"
+        )
     print(f"\n议题（{len(made.topics)} 个正文 + 1 个自动追加的收尾）：")
     for index, topic in enumerate(made.topics, 1):
         print(f"  {index}. [{topic.key}] {topic.section_title}")
 
     print(f"\n蓝图（给机器，也可以手改）：{json_path}")
-    print(f"蓝图（给人看，含两人完整的提示词）：{md_path}")
+    print(f"蓝图（给人看，含全部专家完整的提示词）：{md_path}")
     print(f"\n下一步：uv run duo-forge run --blueprint {json_path}")
     return 0
 
@@ -171,7 +211,11 @@ def _topic_done_line(transcript) -> str:
     """某个议题谈完时那两行（第二行只在提前收手时出现）。"""
     line = f"    对话完成，共 {len(transcript.turns)} 条发言"
     if transcript.stopped_early:
-        line += f"\n    ↑ 挑战者已无新的反对意见，第 {transcript.rounds_run} 轮后提前收手"
+        who = "、".join(transcript.conceding) or "所有其他参与者"
+        line += (
+            f"\n    ↑ {who} 已无新的反对意见，"
+            f"第 {transcript.rounds_run} 轮后提前收手"
+        )
     return line
 
 
@@ -190,6 +234,17 @@ def _cmd_run(args: argparse.Namespace) -> int:
             "用 --blueprint 时人格已经存在，不能再给 --personas-file。"
             "想改人格就直接改蓝图 JSON。",
         )
+    if args.blueprint and args.people is not None:
+        return _fail(
+            "参数冲突",
+            "用 --blueprint 时人数已经存在，不能再给 --people。"
+            "想改人数就改蓝图里的 personas 数组，或者重新 forge。",
+        )
+    if args.blueprint and args.team_hint.strip():
+        return _fail(
+            "参数冲突",
+            "用 --blueprint 时人格已经生成，--team-hint 没有意义。",
+        )
 
     try:
         if args.blueprint:
@@ -199,14 +254,18 @@ def _cmd_run(args: argparse.Namespace) -> int:
         else:
             purpose = _purpose_from_args(args)
             try:
-                plan = _load_persona_plan(args.personas_file)
+                plan = _load_persona_plan(
+                    args.personas_file,
+                    people=args.people,
+                    team_hint=args.team_hint,
+                )
             except PersonaSpecError as exc:
                 return _fail("人格设定有问题", exc)
             print(f"目的：{purpose.summary()}")
             print(
-                "· 两位专家由你提供，正在设计议题……"
-                if plan.both_manual
-                else "· 正在设计两位专家和议题……"
+                f"· {plan.people} 位专家由你提供，正在设计议题……"
+                if plan.all_manual
+                else f"· 正在设计 {plan.people} 位专家和议题……"
             )
             bp = authoring.forge(
                 purpose,
@@ -238,25 +297,31 @@ def _cmd_run(args: argparse.Namespace) -> int:
         print("\n!! 模拟模式：不会调用真实模型，产出的是占位内容，没有参考价值。\n")
     else:
         # 真实模式很慢，先说清楚要等多久，免得跑到一半以为卡死了。
-        # 每个议题 = 每轮 2 次发言 + 1 次整理，开场白不花调用；末尾再花 1 次压速查。
-        # 这是**上限**：挑战者没有新的反对意见时该议题会提前收手。
-        calls = len(topics) * (args.rounds * 2 + 1) + 1
+        # 每个议题 = 每轮 N 次发言 + 1 次整理，开场白不花调用；末尾再花 1 次压速查。
+        # 这是**上限**：所有回应者都没有新的反对意见时该议题会提前收手。
+        calls = len(topics) * (args.rounds * bp.people + 1) + 1
         print(
             f"真实模式：本次最多约 {calls} 次模型调用，每次通常十几秒，"
             f"最多约 {max(1, round(calls * 16 / 60))} 分钟。跑的过程中会逐条打印进展。\n"
         )
 
     def run_start(total: int, rounds: int) -> None:
-        print(
-            f"两位专家：{bp.proposer.name}（{bp.proposer.title}）"
-            f" × {bp.challenger.name}（{bp.challenger.title}）"
-        )
+        heading = "两位专家" if bp.people == 2 else f"{bp.people} 位专家"
+        print(f"{heading}：")
+        for index, persona in enumerate(bp.personas, 1):
+            position = "主提出方" if index == 1 else "回应者"
+            role = persona.display_role
+            extra = "" if role == position else f" · {role}"
+            print(
+                f"  第 {index} 位 · {position}{extra}："
+                f"{persona.name}（{persona.title}）"
+            )
         if args.mock:
             print(f"议题数：{total}，每个议题 {rounds} 轮\n")
         else:
             print(
                 f"议题数：{total}，每个议题最多 {rounds} 轮"
-                f"（上限；挑战者没有新的反对意见会提前收手）\n"
+                f"（上限；所有回应者都没有新的反对意见会提前收手）\n"
             )
 
     def run_done(result) -> None:
@@ -267,7 +332,6 @@ def _cmd_run(args: argparse.Namespace) -> int:
             print(f"一页速查：{result.quick_path}")
 
     hooks = _hooks(run_start, run_done)
-
     from . import pipeline
 
     try:
@@ -324,12 +388,12 @@ def _cmd_show(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="duo-forge",
-        description="给一个目的，生成两位对谈智能体的人格与议题，再让他们对谈出成果",
+        description="给一个目的，生成 2–5 位对谈智能体的人格与议题，再让他们对谈出成果",
     )
     sub = parser.add_subparsers(dest="command")
 
     forge = sub.add_parser(
-        "forge", help="功能一 + 功能二：按目的生成两位专家的人格和一组议题"
+        "forge", help="功能一 + 功能二：按目的生成 2–5 位专家的人格和一组议题"
     )
     _add_purpose_args(forge)
     _add_persona_args(forge)
@@ -359,7 +423,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     run.add_argument(
         "--no-converge", dest="converge", action="store_false",
-        help="跑满每个议题的轮数，不做「挑战者没有新的反对意见就提前收手」的判断",
+        help="跑满每个议题的轮数，不做「所有回应者都没有新的反对意见就提前收手」的判断",
     )
     run.add_argument(
         "--only", default="",
