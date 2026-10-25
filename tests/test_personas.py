@@ -117,7 +117,7 @@ def test_hint_cannot_carry_persona_fields():
     assert "不能再写" in str(excinfo.value)
 
 
-@pytest.mark.parametrize("marker", ["【发言纪律】", "【收手纪律】"])
+@pytest.mark.parametrize("marker", ["【发言纪律】", "【收手纪律】", "【统一纪律】"])
 def test_hint_cannot_contain_the_discipline(marker):
     with pytest.raises(PersonaSpecError) as excinfo:
         parse_persona_spec({"mode": "hint", "hint": marker + "随便写"}, LABEL)
@@ -193,7 +193,7 @@ def test_manual_short_fields_must_be_single_line(field):
     assert "单行" in str(excinfo.value)
 
 
-@pytest.mark.parametrize("marker", ["【发言纪律】", "【收手纪律】"])
+@pytest.mark.parametrize("marker", ["【发言纪律】", "【收手纪律】", "【统一纪律】"])
 def test_manual_message_cannot_contain_the_discipline(marker):
     with pytest.raises(PersonaSpecError) as excinfo:
         parse_persona_spec(
@@ -360,7 +360,7 @@ def test_team_hint_has_a_length_limit():
     assert "团队分工要求太长" in str(excinfo.value)
 
 
-@pytest.mark.parametrize("marker", ["【发言纪律】", "【收手纪律】"])
+@pytest.mark.parametrize("marker", ["【发言纪律】", "【收手纪律】", "【统一纪律】"])
 def test_team_hint_cannot_contain_the_discipline(marker):
     with pytest.raises(PersonaSpecError) as excinfo:
         parse_persona_plan({"team": marker + "随便写"})
