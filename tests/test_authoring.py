@@ -10,15 +10,22 @@ import json
 import pytest
 
 from duo_forge import authoring
-from duo_forge.authoring import AuthoringError, forge, forge_personas, forge_topics
+from duo_forge.authoring import (
+    AuthoringError,
+    distill_material,
+    forge,
+    forge_personas,
+    forge_topics,
+)
 from duo_forge.backends import ScriptedAuthorBackend, ScriptedBackend
 from duo_forge.personas import (
-    CHALLENGER_CONTRACT,
+    CONCESSION_CONTRACT,
     Persona,
+    PersonaPlan,
     full_system_message,
     parse_persona_plan,
 )
-from duo_forge.purpose import Purpose
+from duo_forge.purpose import MAX_MATERIAL, MAX_PURPOSE, Purpose
 from duo_forge.topics import MAX_TOPICS
 
 
@@ -75,7 +82,7 @@ def test_extract_json_reports_what_is_wrong(text, hint):
 
 
 # ---------------------------------------------------------------------------
-# 功能一：生成两位专家
+# 功能一：生成专家
 # ---------------------------------------------------------------------------
 
 
@@ -94,24 +101,24 @@ def test_the_two_personas_are_actually_opposed(purpose, author):
     assert made.proposer.stance != made.challenger.stance
 
 
-def test_challenger_gets_the_concession_contract_and_proposer_does_not():
-    """收手机制是 society 的硬契约，只该追加给挑战者。
+def test_responders_get_the_concession_contract_and_the_opener_does_not():
+    """收手机制是 society 的硬契约，只该追加给回应者。
 
     这条不是「提示词写得对不对」的问题：模型漏写一次不会有任何报错，
     只会让每个议题都闷头跑满轮数（慢、贵，而且看不出来）。
     所以它由代码追加，这里把它钉死。
     """
     persona = Persona("甲", "某身份", "某立场", "【人格】\n内容")
-    as_challenger = full_system_message(persona, challenger=True)
-    as_proposer = full_system_message(persona, challenger=False)
+    as_opener = full_system_message(persona, opener=True)
+    as_responder = full_system_message(persona, opener=False)
 
-    assert CHALLENGER_CONTRACT in as_challenger
-    assert "【无异议】" in as_challenger
-    assert CHALLENGER_CONTRACT not in as_proposer
-    assert "【无异议】" not in as_proposer
+    assert CONCESSION_CONTRACT in as_responder
+    assert "【无异议】" in as_responder
+    assert CONCESSION_CONTRACT not in as_opener
+    assert "【无异议】" not in as_opener
     # 发言纪律两边都有
-    assert "【发言纪律】" in as_challenger
-    assert "【发言纪律】" in as_proposer
+    assert "【发言纪律】" in as_responder
+    assert "【发言纪律】" in as_opener
 
 
 def test_persona_missing_a_field_is_rejected():
@@ -423,7 +430,7 @@ def test_a_missing_manual_side_in_the_model_output_is_fine(purpose):
 
 class ExplodingBackend(ScriptedBackend):
     def _reply(self, messages):
-        raise AssertionError("两位都手写时不该调用人格模型")
+        raise AssertionError("全部手写时不该调用人格模型")
 
 
 def test_both_manual_makes_no_persona_call(purpose):
@@ -491,3 +498,174 @@ def test_generated_discipline_is_rejected_and_retried(purpose):
     assert backend._n == 2
     assert "【发言纪律】" not in made.proposer.system_message
     assert "发言纪律" in backend.seen_prompts[1]  # 重试提示里说清了哪里错
+
+
+# ---------------------------------------------------------------------------
+# 三人及以上：先骨架，再一次性展开
+# ---------------------------------------------------------------------------
+
+
+def test_three_person_forge_uses_the_skeleton_and_expands(purpose, author):
+    made = forge_personas(purpose, backend=author, plan=PersonaPlan(people=3))
+
+    assert len(made.personas) == 3
+    assert made.personas[0].role == "主提出方"
+    assert len({p.role for p in made.personas}) == 3
+    assert len({p.name for p in made.personas}) == 3
+
+
+def test_five_person_forge_offline(purpose, author):
+    made = forge_personas(purpose, backend=author, plan=PersonaPlan(people=5))
+
+    assert len(made.personas) == 5
+    assert len({p.role for p in made.personas}) == 5
+    assert made.personas[0].role == "主提出方"
+
+
+def test_multi_person_forge_calls_the_model_three_times(purpose):
+    """骨架 + 展开 + 议题，正常三次。两人模式仍是两次。"""
+    backend = RecordingAuthorBackend()
+    made = forge(purpose, backend=backend, plan=PersonaPlan(people=3))
+
+    assert backend._calls == 3
+    assert made.people == 3
+
+
+def test_team_hint_reaches_both_persona_prompts(purpose):
+    plan = parse_persona_plan({"team": "要有一个医生、一个患者、一个管理者"}, people=3)
+    backend = RecordingAuthorBackend()
+    forge_personas(purpose, backend=backend, plan=plan)
+
+    assert "一个医生、一个患者、一个管理者" in backend.seen_prompts[0]
+    assert "一个医生、一个患者、一个管理者" in backend.seen_prompts[1]
+
+
+def test_manual_slots_are_not_regenerated_in_multi_person(purpose):
+    plan = parse_persona_plan(
+        {"personas": [_MANUAL_PROPOSER, {}, {}]}, people=3
+    )
+    made = forge_personas(purpose, backend=ScriptedAuthorBackend(), plan=plan)
+
+    assert made.personas[0].name == "许医师"
+    assert made.personas[0].role == "主提出方"  # 手写侧没写 role，按位置补
+    assert len(made.personas) == 3
+
+
+def test_duplicate_roles_in_multi_person_are_rejected():
+    raw = {
+        "title": "标题",
+        "slug": "x",
+        "personas": [
+            {"role": "专家", "name": "甲", "title": "身份", "stance": "立场",
+             "system_message": "内容"},
+            {"role": "专家", "name": "乙", "title": "身份", "stance": "立场",
+             "system_message": "内容"},
+            {"role": "丙", "name": "丙", "title": "身份", "stance": "立场",
+             "system_message": "内容"},
+        ],
+    }
+    with pytest.raises(AuthoringError) as excinfo:
+        authoring._parse_team_personas(raw, plan=PersonaPlan(people=3))
+    assert "角色名" in str(excinfo.value)
+
+
+def test_skeleton_count_mismatch_is_rejected():
+    raw = {
+        "team": [
+            {"role": "甲", "name": "甲", "title": "身份", "stance": "立场"},
+            {"role": "乙", "name": "乙", "title": "身份", "stance": "立场"},
+        ]
+    }
+    with pytest.raises(AuthoringError) as excinfo:
+        authoring._parse_skeleton(raw, plan=PersonaPlan(people=3))
+    assert "应该有 3 位" in str(excinfo.value)
+
+
+def test_three_person_blueprint_has_three_roles(purpose, author):
+    made = forge(purpose, backend=author, topic_count=3, plan=PersonaPlan(people=3))
+
+    assert made.people == 3
+    assert len(made.personas) == 3
+    assert all(p.role for p in made.personas)
+
+
+# ---------------------------------------------------------------------------
+# 网页拖入的材料：先提炼成目的
+# ---------------------------------------------------------------------------
+
+
+def test_distill_material_offline():
+    result = distill_material(
+        "# 颈椎保养\n\n给刚上班、每天坐十小时的程序员写一份能照做的手册。",
+        backend=ScriptedAuthorBackend(),
+        files=["brief.md"],
+    )
+
+    assert result.title == "模拟材料对谈手册"
+    assert result.text
+    assert len(result.text) <= MAX_PURPOSE
+
+
+def test_distill_material_rejects_empty():
+    with pytest.raises(AuthoringError) as excinfo:
+        distill_material("   ", backend=ScriptedAuthorBackend())
+    assert "材料是空的" in str(excinfo.value)
+
+
+def test_distill_material_rejects_too_long():
+    with pytest.raises(AuthoringError) as excinfo:
+        distill_material("长" * (MAX_MATERIAL + 1), backend=ScriptedAuthorBackend())
+    assert "材料太长" in str(excinfo.value)
+
+
+def test_distill_material_sends_files_and_material():
+    backend = RecordingAuthorBackend()
+    material = "# 材料标题\n\nUNIQUE_MATERIAL_MARKER_7c1e\n\n这是正文。"
+
+    distill_material(material, backend=backend, files=["a.md", "b.md"])
+
+    prompt = backend.seen_prompts[0]
+    assert "a.md" in prompt
+    assert "b.md" in prompt
+    assert "UNIQUE_MATERIAL_MARKER_7c1e" in prompt
+
+
+def test_distill_material_retries_on_a_bad_first_answer():
+    good = {
+        "title": "重试提炼的标题",
+        "distilled_purpose": "一份足够长的目的，说明给谁、解决什么、想要什么成果。",
+    }
+    backend = FlakyBackend(good)
+
+    result = distill_material("一些材料", backend=backend)
+
+    assert result.title == "重试提炼的标题"
+    assert backend._calls == 2
+    assert "上一次的输出不能用了" in backend.seen_prompts[1]
+
+
+def test_distill_parse_rejects_an_overlong_purpose():
+    with pytest.raises(AuthoringError) as excinfo:
+        authoring._parse_distilled(
+            {"title": "标题", "distilled_purpose": "长" * (MAX_PURPOSE + 1)}
+        )
+    assert "太长" in str(excinfo.value)
+
+
+def test_distill_parse_rejects_a_short_purpose():
+    with pytest.raises(AuthoringError) as excinfo:
+        authoring._parse_distilled(
+            {"title": "标题", "distilled_purpose": "太短"}
+        )
+    assert "太短" in str(excinfo.value)
+
+
+def test_distill_parse_rejects_a_multiline_title():
+    with pytest.raises(AuthoringError) as excinfo:
+        authoring._parse_distilled(
+            {
+                "title": "第一行\n第二行",
+                "distilled_purpose": "一份足够长的目的，说明给谁、解决什么、想要什么成果。",
+            }
+        )
+    assert "单行" in str(excinfo.value)
