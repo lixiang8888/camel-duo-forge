@@ -1,7 +1,7 @@
 [project]
 name = "camel-duo-forge"
-version = "0.1.0"
-description = "给一个目的，先让模型锻造出两位对谈智能体的人格与议题，再让他们对谈出一份成果"
+version = "0.3.0"
+description = "给一个目的，先让模型锻造出 2–5 位对谈智能体的人格与议题，再让他们对谈出一份成果"
 readme = "README.md"
 requires-python = ">=3.10,<3.15"
 dependencies = [
