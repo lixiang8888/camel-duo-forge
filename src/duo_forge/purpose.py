@@ -12,8 +12,16 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
+
+from dotenv import load_dotenv
+
+# purpose.py 会被 CLI 在 config 之前 import。这里自己读一次 .env，
+# 保证 DUO_FORGE_MAX_MATERIAL 这类设置不依赖 import 顺序。
+ROOT = Path(__file__).resolve().parents[2]
+load_dotenv(ROOT / ".env")
 
 #: 目的长度的上下限。下限挡的是「帮我写点东西」这种推不出任何东西的输入：
 #: 提示词再强也变不出人格来，不如当场告诉他写清楚点，别浪费一次模型调用。
@@ -25,13 +33,36 @@ MAX_PURPOSE = 2000
 
 MAX_TITLE = 60
 
+def _env_limit(name: str, default: int) -> int:
+    """读一个正整数上限；没设、写错或不是正数就用默认值。"""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
 #: 网页拖入材料的总长度上限。材料只用于「提炼目的」这一次调用，不会随每个议题、
 #: 每一轮进入 system message，所以可以比 MAX_PURPOSE 大得多；但也不能无限大，
 #: 否则一次提炼就会把上下文撑爆。
-MAX_MATERIAL = 30000
+#:
+#: 默认 5 万字是给 DeepSeek（64k 上下文）留的安全余量。用支持 1M 上下文的模型时，
+#: 在 `.env` 里设 `DUO_FORGE_MAX_MATERIAL=1000000` 即可。
+MAX_MATERIAL = _env_limit("DUO_FORGE_MAX_MATERIAL", 50000)
 
 #: 一次最多合并多少个文件。真正的限制是总字数，这个只是防止一次拖进上百个文件。
-MAX_MATERIAL_FILES = 20
+#: 可用 `DUO_FORGE_MAX_MATERIAL_FILES` 调整。
+MAX_MATERIAL_FILES = _env_limit("DUO_FORGE_MAX_MATERIAL_FILES", 50)
+
+#: 单份文件的浏览器读取上限。它只是内存保护；真正会先撞上的通常是总字数上限。
+#: 可用 `DUO_FORGE_MAX_MATERIAL_FILE_BYTES` 调整；默认 10 MB，足够装下
+#: 约 100 万字的 UTF-8 中文材料。
+MAX_MATERIAL_FILE_BYTES = _env_limit(
+    "DUO_FORGE_MAX_MATERIAL_FILE_BYTES", 10 * 1024 * 1024
+)
 
 
 class InvalidPurpose(ValueError):
