@@ -51,6 +51,7 @@ launcher**。所以命令行 `duo-forge run` 在没有浏览器、没有 Windows
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import queue
 import shutil
@@ -64,6 +65,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
 
+from duo_forge import followup as followup_mod
 from duo_forge import pipeline
 from duo_forge.blueprint import Blueprint, BlueprintError
 from duo_forge.config import (
@@ -91,8 +93,10 @@ from duo_forge.personas import (
 )
 from duo_forge.purpose import (
     MAX_MATERIAL,
+    MAX_MATERIAL_FILE_BYTES,
     MAX_MATERIAL_FILES,
     MAX_PURPOSE,
+    MAX_TITLE,
     MIN_PURPOSE,
     InvalidPurpose,
     Purpose,
@@ -102,7 +106,9 @@ from duo_forge.topics import (
     CLOSING_KEY,
     CONVERGENCE_KEY,
     DEFAULT_TOPIC_COUNT,
+    MAX_FOLLOWUP_QUESTION,
     MAX_TOPICS,
+    MIN_FOLLOWUP_QUESTION,
     closing_topic,
 )
 
@@ -113,10 +119,9 @@ _APP_ID = "camel-duo-forge-launcher"
 #: 这里再错开一个，两个项目同时开时单实例扫描不会认错人。
 DEFAULT_PORT = 8785
 
-#: 对谈轮数的上限/下限。下限 1 是「一问一答一次」，不是 2——MIN_ROUNDS=2 只约束
-#: 「提前收手」最早能在第几轮发生，不约束结构轮数。
-MIN_ROUNDS = 1
-MAX_ROUNDS = 6
+#: 对谈轮数的上限/下限。真正的定义在 pipeline 里：run 和「追加讨论」共用同一套边界。
+MIN_ROUNDS = pipeline.MIN_ROUNDS
+MAX_ROUNDS = pipeline.MAX_ROUNDS
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +253,8 @@ class _ForgeJob(_Job):
         plan: PersonaPlan,
         material: str = "",
         files: Optional[list[str]] = None,
+        seed: Optional[Purpose] = None,
+        material_mode: str = "distill",
     ) -> None:
         super().__init__(server.bus)
         self.server = server
@@ -259,6 +266,10 @@ class _ForgeJob(_Job):
         self.mock = mock
         #: 用户对团队和每位专家的自定义意图。准入时冻结，worker 里只读。
         self.plan = plan
+        #: 材料 + 用户目的：seed 是用户写的目的，材料只作参考。
+        #: `distill` 模式（没有 seed）仍然从材料本身提炼目的。
+        self.seed = seed
+        self.material_mode = material_mode
 
     def _cancelled_or_superseded(self) -> bool:
         # 需要在锁内调用。被取代（已经有了新 job）和主动取消一样，都不该再写状态。
@@ -277,21 +288,34 @@ class _ForgeJob(_Job):
 
             self._emit(
                 "forge_start",
-                purpose=self.purpose.summary() if self.purpose else "",
+                purpose=(
+                    self.purpose.summary()
+                    if self.purpose
+                    else (self.seed.summary() if self.seed else "")
+                ),
                 topics=self.topic_count,
                 people=self.plan.people,
                 mock=self.mock,
                 material=bool(self.material),
                 files=self.files,
+                seeded=self.seed is not None,
+                materialMode=self.material_mode,
             )
             backend = build_author_backend(mock=self.mock)
 
             if self.material:
                 # 材料可能是一整份长文档，不直接进 system message：
                 # 先压成一段 ≤2000 字的目的，后面的流程只认 Purpose。
-                self._emit("forge_stage", stage="distill")
+                # 给了 seed 时，材料从「目的的来源」降级成「参考资料」，
+                # 模型只把用户的目的具体化（见 authoring.distill_material）。
+                self._emit(
+                    "forge_stage", stage="distill", seeded=self.seed is not None
+                )
                 self.purpose = authoring.distill_material(
-                    self.material, backend=backend, files=self.files
+                    self.material,
+                    backend=backend,
+                    files=self.files,
+                    seed=self.seed,
                 )
                 if self._cancel_if_needed():
                     return
@@ -300,6 +324,7 @@ class _ForgeJob(_Job):
                     title=self.purpose.title,
                     purpose=self.purpose.text,
                     files=self.files,
+                    seeded=self.seed is not None,
                 )
 
             if self.purpose is None:
@@ -382,8 +407,10 @@ class _RunJob(_Job):
         self.converge = converge
         self.out_dir = Path(out_dir)
         #: run_pipeline 的完整结果。下载路由直接从这里取正文与路径，
-        #: 不再把六个字段逐个镜像一遍。
+        #: 不再把六个字段逐个镜像一遍。追加讨论成功后会被原地替换。
         self.result: Optional[pipeline.RunResult] = None
+        #: 这一轮已经成功追加过几次。只在追加成功后才加一，失败不留编号空洞。
+        self.followup_count = 0
 
     def _hooks(self) -> pipeline.PipelineHooks:
         emit = self._emit
@@ -523,6 +550,280 @@ class _RunJob(_Job):
             self._finish()
 
 
+class _FollowupJob(_Job):
+    """读完成果后继续追问：把新的一节追加进**上一轮 run 的**三份产物。
+
+    和 `_RunJob` 的关键区别：它不改 `server.last_run`（那仍然是产生成果的
+    那一轮），而是成功后原地替换 `run_job.result` 里的正文与路径。因此
+    `/handbook`、`/quick`、`/transcript` 三个下载路由不需要认识追加讨论。
+    """
+
+    kind = "followup"
+    failure_label = "追加讨论失败"
+
+    def __init__(
+        self,
+        bus: _Bus,
+        *,
+        run_job: _RunJob,
+        question: str,
+        title: str,
+        rounds: int,
+        mock: bool,
+        converge: bool,
+    ) -> None:
+        super().__init__(bus)
+        self.run_job = run_job
+        self.question = question
+        self.title = title
+        self.rounds = rounds
+        self.mock = mock
+        self.converge = converge
+        #: 编号在准入时冻结（准入在 server._lock 里，同一时刻只有一个 job）。
+        #: 只有成功后才写回 run_job.followup_count，失败不会留下编号空洞。
+        #: 也读一遍手册里已有的编号：手工加过节或换过会话时，以手册为准，
+        #: 免得再写出一个「追加讨论 1」。
+        previous = run_job.result
+        self.index = max(
+            run_job.followup_count + 1,
+            followup_mod.next_index(previous.handbook) if previous else 1,
+        )
+        self.result: Optional[followup_mod.FollowupResult] = None
+
+    def _hooks(self) -> followup_mod.FollowupHooks:
+        emit = self._emit
+        personas = self.run_job.blueprint.personas
+        side_of = {persona.name: index for index, persona in enumerate(personas)}
+        topic_key = f"followup-{self.index}"
+
+        def followup_start(index: int, rounds: int, question: str) -> None:
+            emit(
+                "followup_start",
+                index=index,
+                total=1,
+                rounds=rounds,
+                people=len(personas),
+                mock=self.mock,
+                converge=self.converge,
+                question=question,
+                title=self.title,
+            )
+
+        def topic_start(topic) -> None:
+            emit(
+                "topic_start",
+                index=1,
+                total=1,
+                key=topic.key,
+                title=topic.section_title,
+            )
+
+        def turn(t) -> None:
+            emit(
+                "turn",
+                topic=topic_key,
+                speaker=t.speaker,
+                role=t.role or "",
+                side=f"s{side_of.get(t.speaker, 0)}",
+                text=t.content,
+            )
+
+        def topic_done(transcript) -> None:
+            emit(
+                "topic_done",
+                topic=topic_key,
+                turns=len(transcript.turns),
+                early=transcript.stopped_early,
+                roundsRun=transcript.rounds_run,
+                conceding=list(transcript.conceding),
+            )
+
+        def section_start(topic) -> None:
+            emit(
+                "section_start",
+                topic=topic.key,
+                title=topic.section_title,
+                closing=False,
+            )
+
+        def section_done(markdown: str) -> None:
+            emit("section_done", topic=topic_key, closing=False)
+
+        def converge_start() -> None:
+            emit(
+                "converge_start",
+                title="最终统一意见（本次追加讨论）",
+                people=len(personas),
+            )
+
+        def converge_done(result) -> None:
+            emit(
+                "converge_done",
+                allConceded=result.all_conceded,
+                reservations=[name for name, _ in result.reservations],
+            )
+
+        return followup_mod.FollowupHooks(
+            on_followup_start=followup_start,
+            on_topic_start=topic_start,
+            on_turn=turn,
+            on_topic_done=topic_done,
+            on_section_start=section_start,
+            on_section_done=section_done,
+            on_unify_start=converge_start,
+            on_unify_done=converge_done,
+            on_quick_start=lambda: emit("quick_start"),
+        )
+
+    def _worker(self) -> None:
+        try:
+            previous = self.run_job.result
+            if previous is None:
+                raise RuntimeError("没有可追加的成果。")
+
+            backend = build_backend(mock=self.mock)
+            author_backend = build_author_backend(mock=self.mock)
+            result = followup_mod.run_followup(
+                blueprint=self.run_job.blueprint,
+                handbook=previous.handbook,
+                handbook_path=previous.handbook_path,
+                question=self.question,
+                title=self.title,
+                index=self.index,
+                rounds=self.rounds,
+                mock=self.mock,
+                converge=self.converge,
+                backend=backend,
+                author_backend=author_backend,
+                transcript=previous.transcript,
+                transcript_path=previous.transcript_path,
+                quick_path=previous.quick_path,
+                hooks=self._hooks(),
+                should_stop=self.stopped.is_set,
+            )
+
+            # 先替换 run_job.result，再广播 followup_done：页面收到事件后
+            # 会立刻来取 /handbook，不能让它读到旧正文。
+            self.run_job.result = dataclasses.replace(
+                previous,
+                handbook=result.handbook,
+                handbook_path=result.handbook_path,
+                quick=result.quick,
+                quick_path=result.quick_path,
+                transcript=result.transcript_text,
+                transcript_path=result.transcript_path,
+            )
+            self.run_job.followup_count = result.index
+            self.result = result
+            self._emit(
+                "followup_done",
+                index=result.index,
+                title=result.topic.section_title,
+                question=result.question,
+                handbook=str(result.handbook_path),
+                quick=str(result.quick_path) if result.quick_path else "",
+                transcript=str(result.transcript_path),
+            )
+        except pipeline.RunStopped:
+            self._emit(
+                "notice",
+                kind="final",
+                text="已停止。本次追加作废，成果文件没有被改动。",
+            )
+        except MissingApiKey as exc:
+            self._fail(str(exc).strip(), full=False)
+        except followup_mod.FollowupError as exc:
+            self._fail(str(exc).strip(), full=False)
+        except Exception as exc:  # noqa: BLE001
+            self._fail(str(exc).strip())
+        finally:
+            self._finish()
+
+
+class _ReforgeJob(_Job):
+    """只重生成蓝图的议题或人格，保留目的和标题。
+
+    `topics`：只重新选题，人格不动。
+    `personas`：重新生成人格，并连带重生成议题（议题是围绕这组人写的）。
+    """
+
+    kind = "reforge"
+    failure_label = "重新生成失败"
+
+    def __init__(
+        self,
+        server: "_Server",
+        *,
+        base: Blueprint,
+        what: str,
+        count: int,
+        plan: Optional[PersonaPlan],
+        mock: bool,
+    ) -> None:
+        super().__init__(server.bus)
+        self.server = server
+        self.base = base
+        self.what = what
+        self.count = count
+        self.plan = plan
+        self.mock = mock
+
+    def _cancelled_or_superseded(self) -> bool:
+        with self.server._lock:
+            return self.cancelled.is_set() or self.server.job is not self
+
+    def _cancel_if_needed(self) -> bool:
+        if not self._cancelled_or_superseded():
+            return False
+        self._emit("reforge_cancelled", text="已取消。蓝图没有更新。")
+        return True
+
+    def _worker(self) -> None:
+        try:
+            from duo_forge import authoring  # 惰性 import：会拖进 camel
+
+            self._emit(
+                "reforge_start",
+                what=self.what,
+                title=self.base.title,
+                people=self.plan.people if self.plan else self.base.people,
+                topics=self.count,
+                mock=self.mock,
+            )
+            backend = build_author_backend(mock=self.mock)
+            bp = authoring.reforge_blueprint(
+                self.base,
+                backend=backend,
+                what=self.what,
+                topic_count=self.count,
+                plan=self.plan if self.what == "personas" else None,
+                origin="mock" if self.mock else "model",
+            )
+            if self._cancel_if_needed():
+                return
+
+            json_path, _ = bp.save_bundle(self.server.blueprint_dir)
+            with self.server._lock:
+                if self.cancelled.is_set() or self.server.job is not self:
+                    return
+                self.server.blueprint = bp
+                self.server.blueprint_path = json_path
+
+            # 复用 forge_done：页面已经会把 payload 渲染成新的审阅面板。
+            # `reforge=True` 让页面别把材料框的状态改成「已提炼」——这次没用材料。
+            self._emit(
+                "forge_done",
+                blueprint=_blueprint_payload(bp, json_path),
+                reforge=True,
+            )
+        except MissingApiKey as exc:
+            self._fail(str(exc).strip(), full=False)
+        except Exception as exc:  # noqa: BLE001
+            self._fail(str(exc).strip())
+        finally:
+            self._finish()
+
+
 # ---------------------------------------------------------------------------
 # 3. 蓝图的 JSON 表示（页面、下载共用）
 # ---------------------------------------------------------------------------
@@ -581,6 +882,45 @@ def _pick_doc(job: Optional[_RunJob], kind: str) -> tuple[str, Optional[Path]]:
     if kind == "quick":
         return result.quick, result.quick_path
     return result.transcript, result.transcript_path
+
+
+def _plan_from_body(
+    body: dict, *, default_people: Optional[int] = None
+) -> PersonaPlan:
+    """把 `/forge` 和 `/reforge` 里的人格/人数请求解析成 `PersonaPlan`。
+
+    两个路由用的是同一套规则；放在这里，免得「重新生成人格」和「第一次生成」
+    对同一份输入给出不同解释。
+    """
+    raw_people = body.get("people")
+    people: Optional[int] = None
+    if raw_people is not None:
+        try:
+            people = int(raw_people)
+        except (TypeError, ValueError):
+            raise PersonaSpecError("人数必须是整数。") from None
+    if people is None and default_people is not None:
+        people = default_people
+
+    raw_personas = body.get("personas")
+    if isinstance(raw_personas, list):
+        # 新前端按位置传数组；包成 personas 文件同款结构再走同一套解析。
+        raw_plan: object = {"personas": raw_personas}
+    elif raw_personas is None or isinstance(raw_personas, dict):
+        # None / 旧版 {proposer, challenger} / 人格文件同款都原样交给解析器。
+        raw_plan = raw_personas
+    else:
+        raw_plan = raw_personas  # 交给解析器报一个能看懂的类型错误
+
+    plan = parse_persona_plan(raw_plan, people=people)
+    team_hint = str(body.get("teamHint") or "").strip()
+    if team_hint:
+        plan = PersonaPlan(
+            specs=plan.specs,
+            team_hint=parse_team_hint(team_hint),
+            people=plan.people,
+        )
+    return plan
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -703,8 +1043,12 @@ class _Handler(BaseHTTPRequestHandler):
 
         if path == "/forge":
             self._forge(body)
+        elif path == "/reforge":
+            self._reforge(body)
         elif path == "/run":
             self._run(body)
+        elif path == "/followup":
+            self._followup(body)
         elif path == "/stop":
             self._stop()
         else:
@@ -713,7 +1057,8 @@ class _Handler(BaseHTTPRequestHandler):
     def _forge(self, body: dict) -> None:
         server = self.server
 
-        # 拖入材料时，目的由模型从材料里提炼；此时 purpose/title 不参与本次锻造。
+        # 拖入材料时，默认由模型从材料里提炼目的；materialMode=seed 时，
+        # purpose/title 是用户给的种子目的，材料只作参考。
         raw_material = body.get("material")
         material = raw_material.strip() if isinstance(raw_material, str) else ""
         raw_files = body.get("files")
@@ -725,6 +1070,8 @@ class _Handler(BaseHTTPRequestHandler):
                     if len(files) >= MAX_MATERIAL_FILES:
                         break
 
+        seed: Optional[Purpose] = None
+        material_mode = "distill"
         if material:
             if len(material) > MAX_MATERIAL:
                 self._json(
@@ -737,7 +1084,38 @@ class _Handler(BaseHTTPRequestHandler):
                     }
                 )
                 return
+
+            raw_mode = body.get("materialMode")
+            material_mode = raw_mode.strip() if isinstance(raw_mode, str) else ""
+            if material_mode not in ("", "distill", "seed"):
+                self._json(
+                    {"ok": False, "why": "材料用途只能是 distill 或 seed。"}
+                )
+                return
+            if not material_mode:
+                # 兼容直接调用 / 旧前端：带了目的就按「目的 + 材料」处理。
+                material_mode = (
+                    "seed" if str(body.get("purpose") or "").strip() else "distill"
+                )
+
             purpose: Optional[Purpose] = None
+            if material_mode == "seed":
+                try:
+                    seed = make_purpose(
+                        str(body.get("purpose") or ""),
+                        str(body.get("title") or ""),
+                    )
+                except InvalidPurpose as exc:
+                    self._json(
+                        {
+                            "ok": False,
+                            "why": (
+                                "材料只是参考时，请先写一个目的，再让 AI 结合材料"
+                                f"把它具体化：{exc}"
+                            ),
+                        }
+                    )
+                    return
         else:
             try:
                 purpose = make_purpose(
@@ -750,32 +1128,8 @@ class _Handler(BaseHTTPRequestHandler):
 
         # 和目的一样，人格/人数设定必须在准入/清历史之前校验完：
         # 写错一个字不该把上一轮蓝图和对话历史擦掉。
-        raw_people = body.get("people")
-        people = None
-        if raw_people is not None:
-            try:
-                people = int(raw_people)
-            except (TypeError, ValueError):
-                self._json({"ok": False, "why": "人数必须是整数。"})
-                return
-        raw_personas = body.get("personas")
-        if isinstance(raw_personas, list):
-            # 新前端按位置传数组；包成 personas 文件同款结构再走同一套解析。
-            raw_plan: object = {"personas": raw_personas}
-        elif raw_personas is None or isinstance(raw_personas, dict):
-            # None / 旧版 {proposer, challenger} / 人格文件同款都原样交给解析器。
-            raw_plan = raw_personas
-        else:
-            raw_plan = raw_personas  # 交给解析器报一个能看懂的类型错误
-        team_hint = str(body.get("teamHint") or "").strip()
         try:
-            plan = parse_persona_plan(raw_plan, people=people)
-            if team_hint:
-                plan = PersonaPlan(
-                    specs=plan.specs,
-                    team_hint=parse_team_hint(team_hint),
-                    people=plan.people,
-                )
+            plan = _plan_from_body(body)
         except PersonaSpecError as exc:
             self._json({"ok": False, "why": str(exc)})
             return
@@ -799,6 +1153,8 @@ class _Handler(BaseHTTPRequestHandler):
                 topic_count=count,
                 mock=mock,
                 plan=plan,
+                seed=seed,
+                material_mode=material_mode,
             )
             server.job = job
             # 校验都过了才清历史：填错一个字就把上一轮蓝图的对话历史擦掉太难受。
@@ -811,6 +1167,68 @@ class _Handler(BaseHTTPRequestHandler):
                 "mock": mock,
                 "material": bool(material),
                 "files": files,
+                "seeded": seed is not None,
+                "materialMode": material_mode,
+            }
+        )
+
+    def _reforge(self, body: dict) -> None:
+        server = self.server
+        what = str(body.get("what") or "").strip()
+        if what not in ("topics", "personas"):
+            self._json(
+                {"ok": False, "why": "只能重生成 topics 或 personas。"}
+            )
+            return
+
+        mock = bool(body.get("mock"))
+        raw_count = body.get("topics")
+        count = 0
+        if raw_count is not None:
+            try:
+                count = int(raw_count)
+            except (TypeError, ValueError):
+                self._json({"ok": False, "why": "议题数必须是整数。"})
+                return
+
+        with server._lock:
+            if server.busy():
+                self._json({"ok": False, "why": "已经有一轮在跑了，等它结束。"})
+                return
+            bp = server.blueprint
+            if bp is None:
+                self._json({"ok": False, "why": "还没有蓝图。先锻造一份。"})
+                return
+
+            # 没指定议题数就保持现有数量；指定了才改。
+            count = max(1, min(MAX_TOPICS, count)) if count > 0 else len(bp.topics)
+
+            plan: Optional[PersonaPlan] = None
+            if what == "personas":
+                try:
+                    plan = _plan_from_body(body, default_people=bp.people)
+                except PersonaSpecError as exc:
+                    self._json({"ok": False, "why": str(exc)})
+                    return
+
+            job = _ReforgeJob(
+                server,
+                base=bp,
+                what=what,
+                count=count,
+                plan=plan,
+                mock=mock,
+            )
+            server.job = job
+            server.bus.reset()
+
+        job.start()
+        self._json(
+            {
+                "ok": True,
+                "what": what,
+                "topics": count,
+                "mock": mock,
             }
         )
 
@@ -882,6 +1300,70 @@ class _Handler(BaseHTTPRequestHandler):
                 "mock": mock,
                 "converge": converge,
                 "topics": [t.key for t in topics],
+                "warning": warning,
+            }
+        )
+
+    def _followup(self, body: dict) -> None:
+        server = self.server
+        try:
+            question = followup_mod.check_question(body.get("question"))
+            title = followup_mod.check_title(body.get("title"))
+        except followup_mod.FollowupError as exc:
+            self._json({"ok": False, "why": str(exc)})
+            return
+
+        raw_rounds = body.get("rounds", 3)
+        try:
+            rounds = int(raw_rounds)
+        except (TypeError, ValueError):
+            self._json({"ok": False, "why": "轮数必须是整数。"})
+            return
+        rounds = max(MIN_ROUNDS, min(MAX_ROUNDS, rounds))
+        mock = bool(body.get("mock"))
+        converge = bool(body.get("converge", True))
+
+        with server._lock:
+            if server.busy():
+                self._json({"ok": False, "why": "已经有一轮在跑了，等它结束。"})
+                return
+            run_job = server.last_run
+            if run_job is None or run_job.result is None:
+                self._json(
+                    {"ok": False, "why": "还没有跑完的成果。先跑一轮对谈。"}
+                )
+                return
+            # 准入时冻结「拿谁的结果去追加」。worker 里不再回头读 server.*，
+            # 免得一次新的 run 把正在追加的那份成果换掉。
+            previous = run_job.result
+            job = _FollowupJob(
+                server.bus,
+                run_job=run_job,
+                question=question,
+                title=title,
+                rounds=rounds,
+                mock=mock,
+                converge=converge,
+            )
+            server.job = job
+            server.bus.reset()
+
+        warning = ""
+        if previous.mock != mock:
+            warning = (
+                "注意：原成果是模拟生成的占位内容，但这次追加用真实模型跑；"
+                "两边可能对不上。"
+                if previous.mock
+                else "注意：这次追加是模拟模式，新加的一节是占位内容。"
+            )
+        job.start()
+        self._json(
+            {
+                "ok": True,
+                "index": job.index,
+                "rounds": rounds,
+                "mock": mock,
+                "converge": converge,
                 "warning": warning,
             }
         )
@@ -1013,6 +1495,7 @@ def _boot_payload(server: _Server) -> dict:
         "maxPurpose": MAX_PURPOSE,
         "maxMaterial": MAX_MATERIAL,
         "maxMaterialFiles": MAX_MATERIAL_FILES,
+        "maxMaterialFileBytes": MAX_MATERIAL_FILE_BYTES,
         "defaultRounds": 3,
         "minRounds": MIN_ROUNDS,
         "maxRounds": MAX_ROUNDS,
@@ -1026,6 +1509,9 @@ def _boot_payload(server: _Server) -> dict:
         "maxStance": MAX_STANCE,
         "maxRole": MAX_ROLE,
         "maxTeamHint": MAX_TEAM_HINT,
+        "minFollowup": MIN_FOLLOWUP_QUESTION,
+        "maxFollowup": MAX_FOLLOWUP_QUESTION,
+        "maxFollowupTitle": MAX_TITLE,
         "closing": {
             "key": CLOSING_KEY,
             "title": closing_topic(0).section_title,
@@ -1080,6 +1566,8 @@ _PAGE = r"""<!DOCTYPE html>
   textarea:focus, input[type=text]:focus, select:focus { border-color: var(--accent); }
   #purpose { width: 100%; min-height: 84px; resize: vertical; }
   #title { width: 210px; }
+  #followupQuestion { width: 100%; min-height: 70px; resize: vertical; }
+  #followupTitle { width: 280px; }
   .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .row .spacer { flex: 1; }
   .row + .row { margin-top: 9px; }
@@ -1231,7 +1719,8 @@ _PAGE = r"""<!DOCTYPE html>
     <div class="hint cost" id="forgeHint"></div>
 
     <div class="drop-hint" id="dropHint">
-      也可以把一份或多份 .md / .txt 拖到这里：自动提炼目的并锻造蓝图（停在审阅）。
+      也可以把一份或多份 .md / .txt 拖到这里。材料本身不是目的时，先在上面写一句目的：
+      AI 会结合材料把它具体化。读入后先选材料用途，再点「锻造蓝图」。
       <button type="button" id="pickFiles">选择文件</button>
       <input type="file" id="fileInput" multiple accept=".md,.markdown,.txt" hidden>
     </div>
@@ -1242,7 +1731,17 @@ _PAGE = r"""<!DOCTYPE html>
         <summary>预览材料开头</summary>
         <pre id="materialPreview"></pre>
       </details>
-      <div class="hint">材料内容会发给模型用于提炼目的。</div>
+      <div class="row" style="margin-top:8px">
+        <span style="font-size:12.5px">这份材料</span>
+        <select id="materialMode">
+          <option value="distill">就是一段目的（从材料提炼）</option>
+          <option value="seed">只是参考（用我上面写的目的具体化）</option>
+        </select>
+        <span class="spacer"></span>
+        <button type="button" id="materialForgeBtn">用这份材料锻造</button>
+        <button type="button" id="materialClearBtn">不用材料</button>
+      </div>
+      <div class="hint" id="materialHint"></div>
     </div>
 
     <details id="customBox" class="custom">
@@ -1269,6 +1768,13 @@ _PAGE = r"""<!DOCTYPE html>
     <div class="personas" id="personas"></div>
     <div class="topics" id="topics"></div>
     <div class="row">
+      <span style="font-size:13px">对这批结果不满意？</span>
+      <button type="button" id="reforgeTopicsBtn">重生成议题</button>
+      <button type="button" id="reforgePersonasBtn">重生成人格 + 议题</button>
+      <span class="spacer"></span>
+    </div>
+    <div class="hint" id="reforgeHint"></div>
+    <div class="row" style="margin-top:10px;border-top:1px dashed var(--border);padding-top:10px">
       <span style="font-size:13px">每个议题最多</span>
       <select id="rounds"></select>
       <label style="font-size:13px;display:flex;align-items:center;gap:5px;cursor:pointer"
@@ -1283,6 +1789,22 @@ _PAGE = r"""<!DOCTYPE html>
       <button id="stopBtn" disabled>停止</button>
     </div>
     <div class="hint" id="runHint"></div>
+  </div>
+
+  <div class="card pad hidden" id="step3">
+    <div class="stephead">
+      <span class="stepnum">3</span><strong>读完成果后继续追问 / 追加议题</strong>
+      <span class="spacer"></span>
+      <span class="hint" id="followupMeta" style="margin:0">可反复追加 · 使用产出这份成果的专家</span>
+    </div>
+    <textarea id="followupQuestion"
+      placeholder="还有想问的，或者想让他们再谈一个点？例如：第 3 节说的「每小时起身」在连续开会时到底怎么执行？"></textarea>
+    <div class="row">
+      <input type="text" id="followupTitle" placeholder="这一节的标题（留空由模型起）">
+      <span class="spacer"></span>
+      <button class="primary" id="followupBtn">追加讨论</button>
+    </div>
+    <div class="hint" id="followupHint"></div>
   </div>
 
   <div class="card pad">
@@ -1324,7 +1846,8 @@ let running = false;
 let jobKind = "";          // "forge" | "run"
 let pendingMaterial = "";  // 已经读进浏览器的材料全文
 let pendingFiles = [];     // 材料文件名
-let materialQueued = false; // 下一次 forge 会不会多一次「材料提炼」调用
+let materialQueued = false; // 下一次 forge 会不会多一次「材料处理」调用
+let materialSeeded = false; // 这一轮材料是「用户目的 + 参考资料」还是「材料本身就是目的」
 
 // ---- 初始化控件的可选项 ----
 for (let n = BOOT.minPeople; n <= BOOT.maxPeople; n++) {
@@ -1347,6 +1870,8 @@ for (let n = BOOT.minRounds; n <= BOOT.maxRounds; n++) {
 $("rounds").value = String(BOOT.defaultRounds);
 $("forgeMock").checked = !!BOOT.mockDefault;
 $("runMock").checked = !!BOOT.mockDefault;
+$("followupQuestion").maxLength = BOOT.maxFollowup;
+$("followupTitle").maxLength = BOOT.maxFollowupTitle;
 
 // ---- 目的草稿：只防刷新丢失，不是数据源 ----
 const PSTORE = "duo-forge-purpose";
@@ -1360,7 +1885,11 @@ function updatePurposeCount() {
   $("purposeCount").style.color =
     n > 0 && (n < BOOT.minPurpose || n > BOOT.maxPurpose) ? "var(--bad)" : "";
 }
-$("purpose").addEventListener("input", () => { savePurpose(); updatePurposeCount(); });
+$("purpose").addEventListener("input", () => {
+  savePurpose();
+  updatePurposeCount();
+  updateMaterialHint();
+});
 updatePurposeCount();
 
 // ---- 自定义团队与人格 ----
@@ -1469,6 +1998,7 @@ function makeEditor(slot) {
     refresh();
     savePersonaDrafts();
     updateForgeHint();
+    updateReforgeHint();
   }
   mode.onchange = touch;
   [hint, msg, role, name, title, stance].forEach((el) => el.addEventListener("input", touch));
@@ -1569,6 +2099,10 @@ function rebuildEditors() {
   updateForgeHint();
 }
 
+function currentMaterialMode() {
+  return $("materialMode").value === "seed" ? "seed" : "distill";
+}
+
 function updateForgeHint() {
   const n = currentPeople();
   savePersonaDrafts();
@@ -1576,9 +2110,13 @@ function updateForgeHint() {
   for (let slot = 1; slot <= n; slot++) {
     if ((personaDrafts[slot] || {}).mode !== "manual") { allManual = false; break; }
   }
+  const hasMaterial = materialQueued || !!pendingMaterial;
   const base = allManual ? 1 : (n === 2 ? 2 : 3);
-  const calls = base + (materialQueued ? 1 : 0);
-  const stages = (materialQueued ? "材料提炼 + " : "")
+  const calls = base + (hasMaterial ? 1 : 0);
+  const materialStage = hasMaterial
+    ? (currentMaterialMode() === "seed" ? "目的具体化 + " : "材料提炼 + ")
+    : "";
+  const stages = materialStage
     + (allManual ? "议题" : (n === 2 ? "人格 + 议题" : "团队骨架 + 人格 + 议题"));
   $("forgeHint").textContent =
     "正常调用模型 " + calls + " 次（" + stages + "）；格式不对会自动重试。" +
@@ -1603,6 +2141,7 @@ function showMaterialFiles(files, state) {
     (files && files.length) ? files.join("、") : "拖入的材料";
   $("materialMeta").textContent = state || "";
   $("materialDetails").classList.add("hidden");
+  updateMaterialHint();
 }
 
 function showMaterial(material, files) {
@@ -1611,6 +2150,21 @@ function showMaterial(material, files) {
   $("materialMeta").textContent = "已读入 " + material.length + " 字";
   $("materialPreview").textContent = material.slice(0, 1200);
   $("materialDetails").classList.remove("hidden");
+  updateMaterialHint();
+}
+
+function updateMaterialHint() {
+  if ($("materialBox").classList.contains("hidden")) { return; }
+  const seeded = currentMaterialMode() === "seed";
+  const missing = seeded && $("purpose").value.trim().length < BOOT.minPurpose;
+  $("materialHint").className = missing ? "hint cost" : "hint";
+  $("materialHint").textContent = seeded
+    ? (missing
+      ? "材料只是参考：先在上面写一句目的（至少 " + BOOT.minPurpose + " 字），"
+        + "AI 会结合材料把它具体化。"
+      : "材料只是参考：AI 会以你上面写的目的为主，用材料补细节。")
+    : "材料本身就是目的：AI 会从材料提炼标题和目的；上面的目的框这次不参与。";
+  $("materialForgeBtn").textContent = seeded ? "用目的 + 材料锻造" : "用这份材料锻造";
 }
 
 async function handleFiles(fileList) {
@@ -1629,9 +2183,10 @@ async function handleFiles(fileList) {
     notice("只支持 .md / .markdown / .txt：" + bad.map((f) => f.name).join("、"), "bad");
     return;
   }
-  const tooBig = files.filter((f) => f.size > 512 * 1024);
+  const maxFileMb = Math.round(BOOT.maxMaterialFileBytes / (1024 * 1024));
+  const tooBig = files.filter((f) => f.size > BOOT.maxMaterialFileBytes);
   if (tooBig.length) {
-    notice("文件太大（单份上限 512 KB）：" + tooBig.map((f) => f.name).join("、"), "bad");
+    notice("文件太大（单份上限 " + maxFileMb + " MB）：" + tooBig.map((f) => f.name).join("、"), "bad");
     return;
   }
 
@@ -1672,8 +2227,12 @@ async function handleFiles(fileList) {
   pendingMaterial = material;
   pendingFiles = files.map((f) => f.name);
   showMaterial(pendingMaterial, pendingFiles);
-  notice("已读入 " + pendingFiles.length + " 份材料，正在提炼目的并锻造蓝图……", "");
-  await startForge({ material: pendingMaterial, files: pendingFiles });
+  updateForgeHint();
+  notice(
+    "已读入 " + pendingFiles.length + " 份材料。选好材料用途后，"
+    + "点「锻造蓝图」或材料框里的按钮。",
+    ""
+  );
 }
 
 const dropZone = $("step1");
@@ -1702,6 +2261,28 @@ $("pickFiles").onclick = () => { if (!running) { $("fileInput").click(); } };
 $("fileInput").onchange = () => {
   handleFiles($("fileInput").files);
   $("fileInput").value = "";
+};
+$("materialMode").addEventListener("change", () => {
+  updateMaterialHint();
+  updateForgeHint();
+});
+$("materialForgeBtn").onclick = () => {
+  if (running || !pendingMaterial) { return; }
+  startForge({
+    material: pendingMaterial,
+    files: pendingFiles,
+    mode: currentMaterialMode(),
+  });
+};
+$("materialClearBtn").onclick = () => {
+  if (running) { return; }
+  pendingMaterial = "";
+  pendingFiles = [];
+  $("materialBox").classList.add("hidden");
+  $("fileInput").value = "";
+  updateForgeHint();
+  updateMaterialHint();
+  notice("已移除材料，接下来按上面的目的锻造。", "");
 };
 
 function saveTeamDraft() {
@@ -1737,6 +2318,7 @@ $("teamHint").addEventListener("input", () => {
 $("people").onchange = () => {
   rebuildEditors();
   saveTeamDraft();
+  updateReforgeHint();
 };
 
 // ---- 状态与提示 ----
@@ -1755,8 +2337,10 @@ function notice(text, tone) {
 }
 const LOCKED_WHILE_RUNNING = [
   "forgeBtn", "purpose", "title", "people", "teamHint", "topicCount", "forgeMock",
-  "pickFiles", "fileInput",
+  "pickFiles", "fileInput", "materialMode", "materialForgeBtn", "materialClearBtn",
   "runBtn", "rounds", "converge", "runMock",
+  "reforgeTopicsBtn", "reforgePersonasBtn",
+  "followupBtn", "followupQuestion", "followupTitle",
 ];
 function setRunning(on) {
   running = on;
@@ -1898,6 +2482,8 @@ function renderBlueprint(payload) {
     '<p class="dl"><a href="/blueprint.json">下载蓝图 .json（可手改）</a>' +
     '<a href="/blueprint.md">下载可读版 .md</a></p>';
   updateRunHint();
+  updateFollowupHint();
+  updateReforgeHint();
 }
 
 function selectedKeys() {
@@ -1920,6 +2506,37 @@ function updateRunHint() {
         ? "轮数是上限：所有回应者都提不出新反对意见的议题会提前收手；"
           + "全部议题结束后若仍有分歧，会再补一轮（最多 " + people + " 次发言）强制统一。"
         : "已关闭收敛：每个议题跑满轮数，结束后也不做最终统一。");
+}
+
+function updateFollowupHint() {
+  const on = $("runMock").checked;
+  const converge = $("converge").checked;
+  const people = bp && bp.people ? bp.people : 2;
+  const rounds = parseInt($("rounds").value, 10) || 3;
+  const calls = 1 + rounds * people + 1 + (converge ? people : 0) + 1;
+  $("followupHint").className = on ? "hint" : "hint cost";
+  $("followupHint").textContent = on
+    ? "模拟模式：新加的一节是占位内容；成果手册、速查和实录仍会更新。"
+    : "会把新的一节写进当前成果手册，并按更新后的全文重压一页速查。"
+      + "真实模式最多约 " + calls + " 次模型调用（追问设计 + 对谈 + 整理"
+      + (converge ? " + 统一" : "") + " + 速查）。";
+}
+
+function updateReforgeHint() {
+  if (!bp) { $("reforgeHint").textContent = ""; return; }
+  const on = $("forgeMock").checked;
+  const n = currentPeople();
+  savePersonaDrafts();
+  let allManual = true;
+  for (let slot = 1; slot <= n; slot++) {
+    if ((personaDrafts[slot] || {}).mode !== "manual") { allManual = false; break; }
+  }
+  const personaCalls = allManual ? 1 : (n === 2 ? 2 : 3);
+  $("reforgeHint").className = on ? "hint" : "hint cost";
+  $("reforgeHint").textContent = on
+    ? "模拟模式：重新生成的人格/议题是占位内容。"
+    : "重生成议题约 1 次模型调用；重生成人格会连带重生成议题，"
+      + n + " 人约 " + personaCalls + " 次调用。目的和标题都不变。";
 }
 
 // ---- markdown：只覆盖 digest.py / blueprint.py 实际产出的语法 ----
@@ -1987,6 +2604,12 @@ async function loadResults() {
   trRaw = tr.markdown || "";
   if (!hbRaw.trim() && !quickRaw.trim()) { return; }
   renderResults();
+  showFollowup(true);
+}
+
+function showFollowup(on) {
+  $("step3").classList.toggle("hidden", !on);
+  if (on) { updateFollowupHint(); }
 }
 function renderResults() {
   const warn = $("runMock").checked
@@ -2014,6 +2637,7 @@ function handle(ev) {
     setRunning(true);       // 刷新页面时靠重放的历史事件恢复「运行中」状态
     bp = null;
     $("step2").classList.add("hidden");
+    showFollowup(false);
     $("bpView").innerHTML = '<div class="empty">还没有蓝图。</div>';
     $("chat").innerHTML = '<div class="empty" id="empty">蓝图生成后才会开始对谈。</div>';
     $("out").innerHTML = '<div class="empty">跑完才有成果。</div>';
@@ -2025,12 +2649,30 @@ function handle(ev) {
     clearInterval(timerId);
     timerId = setInterval(tickElapsed, 1000);
     tickElapsed();
-    setActivity(ev.material ? "正在读取材料" : "准备调用模型", true);
-    setStatus(ev.material ? "读材料中" : "锻造中", "live");
+    materialSeeded = !!ev.seeded;
+    setActivity(
+      ev.material
+        ? (materialSeeded ? "正在结合材料具体化目的" : "正在读取材料")
+        : "准备调用模型",
+      true
+    );
+    setStatus(
+      ev.material
+        ? (materialSeeded ? "具体化目的中" : "读材料中")
+        : "锻造中",
+      "live"
+    );
     materialQueued = !!ev.material;
     updateForgeHint();
     if (ev.material) {
-      if (ev.files && ev.files.length) { showMaterialFiles(ev.files, "正在提炼目的"); }
+      $("materialMode").value = materialSeeded ? "seed" : "distill";
+      updateMaterialHint();
+      if (ev.files && ev.files.length) {
+        showMaterialFiles(
+          ev.files,
+          materialSeeded ? "正在结合材料具体化目的" : "正在提炼目的"
+        );
+      }
     } else {
       // 手动锻造没有用材料，把上一份材料的展示收起来，别让人以为这次也用了。
       $("materialBox").classList.add("hidden");
@@ -2039,30 +2681,49 @@ function handle(ev) {
     }
     pickTab("chat");
   } else if (ev.type === "forge_stage") {
+    const seeded = ev.stage === "distill" && materialSeeded;
     const text = ev.stage === "distill"
-      ? "正在读材料、提炼目的"
+      ? (seeded ? "正在结合材料把目的具体化" : "正在读材料、提炼目的")
       : ev.stage === "personas"
         ? "正在设计专家团队"
         : "正在设计议题";
     setActivity(text, true);
-    if (ev.stage === "distill") { setStatus("提炼目的中", "live"); }
+    if (ev.stage === "distill") {
+      setStatus(seeded ? "具体化目的中" : "提炼目的中", "live");
+    }
   } else if (ev.type === "material_distilled") {
+    materialSeeded = !!ev.seeded;
     $("purpose").value = ev.purpose || "";
     $("title").value = ev.title || "";
     updatePurposeCount();
     if (pendingMaterial) {
       showMaterial(pendingMaterial, pendingFiles);
-      $("materialMeta").textContent = "已提炼 · 正在锻造";
+      $("materialMeta").textContent = materialSeeded
+        ? "已具体化 · 正在锻造"
+        : "已提炼 · 正在锻造";
     } else if (ev.files && ev.files.length) {
-      showMaterialFiles(ev.files, "已提炼 · 正在锻造");
+      showMaterialFiles(
+        ev.files,
+        materialSeeded ? "已具体化 · 正在锻造" : "已提炼 · 正在锻造"
+      );
     }
-    setActivity("已提炼出目的，正在锻造蓝图", true);
-    notice("已从 " + (ev.files || []).length + " 份材料提炼出目的和标题。", "");
+    setActivity(
+      materialSeeded ? "已具体化目的，正在锻造蓝图" : "已提炼出目的，正在锻造蓝图",
+      true
+    );
+    notice(
+      materialSeeded
+        ? "已结合你写的目的和材料，把它具体化了。"
+        : "已从 " + (ev.files || []).length + " 份材料提炼出目的和标题。",
+      ""
+    );
   } else if (ev.type === "forge_done") {
+    const seeded = materialSeeded;
+    materialSeeded = false;
     materialQueued = false;
     updateForgeHint();
-    if (!$("materialBox").classList.contains("hidden")) {
-      $("materialMeta").textContent = "已提炼";
+    if (!ev.reforge && !$("materialBox").classList.contains("hidden")) {
+      $("materialMeta").textContent = seeded ? "已具体化" : "已提炼";
     }
     renderBlueprint(ev.blueprint);
     setActivity("蓝图已生成");
@@ -2077,15 +2738,49 @@ function handle(ev) {
     endRun();
   } else if (ev.type === "forge_cancelled") {
     materialQueued = false;
+    materialSeeded = false;
     updateForgeHint();
     notice(ev.text || "已取消。", "warn");
     setActivity("已取消");
     setStatus("已取消", "warn");
     endRun();
     restoreBlueprint();
+  } else if (ev.type === "reforge_start") {
+    jobKind = "reforge";
+    setRunning(true);
+    notice("");
+    setActivity(
+      ev.what === "topics" ? "正在重新生成议题" : "正在重新生成人格与议题",
+      true
+    );
+    setStatus("重新生成中", "live");
+    $("progress").textContent = ev.what === "topics"
+      ? "正在重新生成议题……"
+      : "正在重新生成人格与议题……";
+    startedAt = Date.now();
+    clearInterval(timerId);
+    timerId = setInterval(tickElapsed, 1000);
+    tickElapsed();
+  } else if (ev.type === "reforge_cancelled") {
+    notice(ev.text || "已取消。", "warn");
+    setActivity("已取消");
+    setStatus("已取消", "warn");
+    endRun();
+  } else if (ev.type === "followup_start") {
+    jobKind = "followup";
+    setRunning(true);
+    $("chat").innerHTML = "";
+    notice("");
+    $("progress").textContent = "第 " + ev.index + " 次追加讨论";
+    beginRun(1, ev.rounds, ev.people || 2, ev.converge);
+    setActivity("正在设计这次追问的议题", true);
+    setStatus("追加讨论中", "live");
+    pickTab("chat");
+    updateFollowupHint();
   } else if (ev.type === "run_start") {
     jobKind = "run";
     setRunning(true);
+    showFollowup(false);
     $("chat").innerHTML = "";
     $("out").innerHTML = '<div class="empty">跑完才有成果。</div>';
     hbRaw = ""; quickRaw = ""; trRaw = "";
@@ -2131,15 +2826,22 @@ function handle(ev) {
       $("progress").textContent += "　→ 所有回应者都接受统一结论";
     } else {
       const who = (ev.reservations || []).join("、") || "部分回应者";
-      $("progress").textContent += "　→ " + who + " 仍保留意见（附录 D）";
+      $("progress").textContent += "　→ " + who + " 仍保留意见"
+        + (jobKind === "followup" ? "（写在本次追加的小节里）" : "（附录 D）");
     }
   } else if (ev.type === "quick_start") {
-    setActivity("正在把整份成果压成一页速查", true);
+    setActivity(
+      jobKind === "followup"
+        ? "正在按更新后的全文重压一页速查"
+        : "正在把整份成果压成一页速查",
+      true
+    );
     setStatus("压缩中", "live");
     $("progress").textContent += "　→ 正在生成一页速查";
   } else if (ev.type === "notice") {
     if (ev.job === "forge") {
       materialQueued = false;
+      materialSeeded = false;
       updateForgeHint();
       if (!$("materialBox").classList.contains("hidden")) {
         $("materialMeta").textContent = "本次锻造未完成";
@@ -2155,6 +2857,17 @@ function handle(ev) {
     setStatus("完成", "");
     setActivity("完成");
     endRun();
+    showFollowup(true);
+    loadResults();
+  } else if (ev.type === "followup_done") {
+    $("progress").textContent = "✓ 已追加第 " + ev.index + " 节：" + ev.title;
+    setStatus("完成", "");
+    setActivity("完成");
+    endRun();
+    $("followupQuestion").value = "";
+    $("followupTitle").value = "";
+    notice("已把第 " + ev.index + " 次追问写进成果手册。", "");
+    showFollowup(true);
     loadResults();
   } else if (ev.type === "done") {
     setRunning(false);
@@ -2179,17 +2892,40 @@ async function post(path, body) {
 
 // ---- 按钮 ----
 async function startForge(options = {}) {
-  const material = (options.material || "").trim();
-  const files = options.files || [];
+  let material = (options.material || "").trim();
+  let files = options.files || [];
+  let mode = options.mode || "";
   let purpose = "";
   let title = "";
+
+  // 主按钮：如果材料已经读入，就按材料框里选的用途把它一起发出去。
+  if (!material && pendingMaterial) {
+    material = pendingMaterial;
+    files = pendingFiles;
+    mode = currentMaterialMode();
+  }
 
   if (material) {
     if (material.length > BOOT.maxMaterial) {
       notice("材料太长（" + material.length + " 字），上限 " + BOOT.maxMaterial + " 字。", "bad");
       return;
     }
+    mode = mode === "seed" ? "seed" : "distill";
+    if (mode === "seed") {
+      purpose = $("purpose").value.trim();
+      title = $("title").value.trim();
+      if (purpose.length < BOOT.minPurpose) {
+        notice(
+          "材料只是参考时，先在上面写一句目的（至少 " + BOOT.minPurpose
+          + " 字），AI 会结合材料把它具体化。",
+          "bad"
+        );
+        $("purpose").focus();
+        return;
+      }
+    }
   } else {
+    mode = "";
     purpose = $("purpose").value.trim();
     if (purpose.length < BOOT.minPurpose) {
       notice("目的太短了：至少 " + BOOT.minPurpose + " 字，要说清「给谁、解决什么、要什么」。", "bad");
@@ -2222,8 +2958,15 @@ async function startForge(options = {}) {
   materialQueued = !!material;
   updateForgeHint();
   setRunning(true);
-  setActivity(material ? "已收到材料，准备提炼目的" : "启动中", true);
-  const res = await post("/forge", {
+  setActivity(
+    material
+      ? (mode === "seed"
+        ? "已收到目的和材料，准备具体化目的"
+        : "已收到材料，准备提炼目的")
+      : "启动中",
+    true
+  );
+  const body = {
     purpose: purpose,
     title: title,
     people: people,
@@ -2231,9 +2974,13 @@ async function startForge(options = {}) {
     topics: parseInt($("topicCount").value, 10),
     mock: $("forgeMock").checked,
     personas: personas,
-    material: material || undefined,
-    files: files.length ? files : undefined,
-  });
+  };
+  if (material) {
+    body.material = material;
+    body.materialMode = mode;
+    if (files.length) { body.files = files; }
+  }
+  const res = await post("/forge", body);
   if (!res.ok) {
     materialQueued = false;
     updateForgeHint();
@@ -2244,6 +2991,31 @@ async function startForge(options = {}) {
 }
 
 $("forgeBtn").onclick = () => startForge();
+
+async function startReforge(what) {
+  if (!bp || running) { return; }
+  const payload = {
+    what: what,
+    topics: bp.topics.length,
+    mock: $("forgeMock").checked,
+  };
+  if (what === "personas") {
+    // 用第一步里的人格草稿：手写/给方向的位置保留，auto 的位置重新生成。
+    payload.people = currentPeople();
+    payload.personas = collectPersonas();
+    payload.teamHint = $("teamHint").value.trim();
+  }
+  setRunning(true);
+  setActivity("启动中", true);
+  const res = await post("/reforge", payload);
+  if (!res.ok) {
+    setRunning(false);
+    setActivity("");
+    notice(res.why || "启动失败", "bad");
+  }
+}
+$("reforgeTopicsBtn").onclick = () => startReforge("topics");
+$("reforgePersonasBtn").onclick = () => startReforge("personas");
 
 $("runBtn").onclick = async () => {
   const keys = selectedKeys();
@@ -2273,9 +3045,45 @@ $("stopBtn").onclick = async () => {
   await post("/stop");
 };
 
-$("runMock").onchange = updateRunHint;
-$("rounds").onchange = updateRunHint;
-$("converge").onchange = updateRunHint;
+$("followupBtn").onclick = async () => {
+  const question = $("followupQuestion").value.trim();
+  if (question.length < BOOT.minFollowup) {
+    notice("先写想问的问题（至少 " + BOOT.minFollowup + " 字）。", "bad");
+    return;
+  }
+  if (question.length > BOOT.maxFollowup) {
+    notice("追问太长了：上限 " + BOOT.maxFollowup + " 字。", "bad");
+    return;
+  }
+  setRunning(true);
+  setActivity("启动中", true);
+  const res = await post("/followup", {
+    question: question,
+    title: $("followupTitle").value.trim(),
+    rounds: parseInt($("rounds").value, 10),
+    converge: $("converge").checked,
+    mock: $("runMock").checked,
+  });
+  if (!res.ok) {
+    setRunning(false);
+    setActivity("");
+    notice(res.why || "启动失败", "bad");
+  } else if (res.warning) {
+    notice(res.warning, "warn");
+  }
+};
+
+function refreshRunHints() {
+  updateRunHint();
+  updateFollowupHint();
+}
+$("runMock").onchange = refreshRunHints;
+$("rounds").onchange = refreshRunHints;
+$("converge").onchange = refreshRunHints;
+$("forgeMock").onchange = () => {
+  updateForgeHint();
+  updateReforgeHint();
+};
 
 // ---- Tab ----
 function pickTab(which) {
@@ -2311,6 +3119,9 @@ async function bootstrap() {
   } catch (e) { /* 忽略 */ }
 }
 updateRunHint();
+updateFollowupHint();
+updateReforgeHint();
+updateMaterialHint();
 connect();
 bootstrap();
 </script>

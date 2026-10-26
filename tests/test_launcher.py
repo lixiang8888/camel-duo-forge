@@ -488,6 +488,14 @@ def test_early_returns_do_not_corrupt_the_keep_alive_connection(live_server):
         assert request("POST", "/run", {"keys": ["x"]})[0] == 200
         assert request("GET", "/health")[0] == 200
 
+        # 追问太短：校验失败，提前返回
+        assert request("POST", "/followup", {"question": "x"})[0] == 200
+        assert request("GET", "/health")[0] == 200
+
+        # 不认识的重生成目标：提前返回
+        assert request("POST", "/reforge", {"what": "nope"})[0] == 200
+        assert request("GET", "/health")[0] == 200
+
         # 没有任务在跑：停止也提前返回
         assert request("POST", "/stop", {})[0] == 200
         assert request("GET", "/health")[0] == 200
@@ -845,3 +853,328 @@ def test_page_boot_has_material_limits(live_server):
     boot = json.loads(re.search(r"const BOOT = (.*?);\n", html).group(1))
     assert boot["maxMaterial"] == launcher.MAX_MATERIAL
     assert boot["maxMaterialFiles"] == launcher.MAX_MATERIAL_FILES
+    assert boot["maxMaterialFileBytes"] == launcher.MAX_MATERIAL_FILE_BYTES
+
+
+def test_forge_accepts_material_above_the_old_limit(live_server):
+    """30k → 50k 之后，4 万字的材料应该能正常开始锻造。"""
+    server, port = live_server
+    q = server.bus.subscribe()
+    material = "材" * 40000
+
+    res = _post(
+        port,
+        "/forge",
+        {"material": material, "files": ["big.md"], "topics": 1, "mock": True},
+    )
+    assert res["ok"], res
+
+    assert _wait_for(q, "material_distilled")
+    assert _wait_for(q, "forge_done")
+    assert _wait_for(q, "done")
+    assert server.job.finished.wait(2)
+
+
+# ---------------------------------------------------------------------------
+# 追加讨论：读完成果后的追问
+# ---------------------------------------------------------------------------
+
+
+def _run_once(server, port, bp, *, rounds: int = 1) -> None:
+    """在 forged 之后跑一轮最小的 mock run，拿到一份可追加的成果。"""
+    first = bp["topics"][0]["key"]
+    q = server.bus.subscribe()
+    res = _post(port, "/run", {"keys": [first], "rounds": rounds, "mock": True})
+    assert res["ok"], res
+    assert _wait_for(q, "run_done")
+    assert _wait_for(q, "done")
+    assert server.job.finished.wait(2)
+
+
+def test_followup_without_a_finished_run_is_rejected(live_server):
+    server, port = live_server
+    res = _post(port, "/followup", {"question": "这个到底怎么做？"})
+    assert res["ok"] is False
+    assert "还没有跑完" in res["why"]
+    assert server.bus._history == []
+
+
+def test_followup_rejects_a_blank_question(forged):
+    server, port, bp = forged
+    _run_once(server, port, bp)
+    history = list(server.bus._history)
+
+    res = _post(port, "/followup", {"question": "   "})
+    assert res["ok"] is False
+    assert "追问" in res["why"]
+    assert server.bus._history == history, "校验失败不该清掉历史"
+
+
+def test_followup_appends_to_the_handbook_and_can_repeat(forged):
+    server, port, bp = forged
+    _run_once(server, port, bp)
+    before = _get_json(port, "/handbook")["markdown"]
+
+    q = server.bus.subscribe()
+    res = _post(
+        port,
+        "/followup",
+        {"question": "连续开会时做不到怎么办？", "rounds": 1, "mock": True},
+    )
+    assert res["ok"], res
+    assert res["index"] == 1
+    start = _wait_for(q, "followup_start")
+    assert start["index"] == 1
+    done = _wait_for(q, "followup_done")
+    assert done["index"] == 1
+    assert _wait_for(q, "done")
+    assert server.job.finished.wait(2)
+
+    after = _get_json(port, "/handbook")["markdown"]
+    assert "## 追加讨论 1：" in after
+    assert "连续开会时做不到怎么办？" in after
+    # 原正文还在，新一节插在免责声明之前
+    before_body = before.split("---\n\n*本文件由 camel-duo-forge 生成")[0].rstrip()
+    assert before_body in after
+    assert after.index("## 追加讨论 1：") < after.rindex(
+        "本文件由 camel-duo-forge 生成"
+    )
+    assert "## 议题：追加讨论 1：" in _get_json(port, "/transcript")["markdown"]
+    assert "## 追加讨论 1：" in _get(port, "/handbook.md")
+    assert _get_status(port, "/handbook.md") == 200
+
+    # 再来一次：编号递增，两节都在。
+    # 订阅放在 POST 之后：准入时 bus.reset() 会清掉第一次追加的历史，
+    # 这时候 replay 里才只有这一次的事件（否则会先读到上一次的 followup_done）。
+    res2 = _post(
+        port,
+        "/followup",
+        {"question": "那只能坐着做两分钟呢？", "rounds": 1, "mock": True},
+    )
+    assert res2["ok"], res2
+    assert res2["index"] == 2
+    q2 = server.bus.subscribe()
+    assert _wait_for(q2, "followup_done")["index"] == 2
+    assert _wait_for(q2, "done")
+    assert server.job.finished.wait(2)
+
+    final = _get_json(port, "/handbook")["markdown"]
+    assert "## 追加讨论 1：" in final
+    assert "## 追加讨论 2：" in final
+    assert final.count("## 追加讨论 ") == 2
+
+
+def test_a_second_followup_is_rejected_while_a_job_is_running(forged):
+    server, port, bp = forged
+    _run_once(server, port, bp)
+    server.job = _NeverFinishes()
+
+    res = _post(port, "/followup", {"question": "还能再问一个吗？"})
+    assert res["ok"] is False
+    assert "已经有一轮" in res["why"]
+
+
+def test_stopping_a_followup_leaves_the_handbook_untouched(forged, monkeypatch):
+    server, port, bp = forged
+    _run_once(server, port, bp)
+    before = {path: path.read_bytes() for path in server.out_dir.glob("*")}
+
+    blocker = threading.Event()
+
+    def fake_followup(*, should_stop, **kwargs):
+        while not should_stop():
+            blocker.wait(0.02)
+        raise launcher.pipeline.RunStopped()
+
+    monkeypatch.setattr(launcher.followup_mod, "run_followup", fake_followup)
+
+    q = server.bus.subscribe()
+    res = _post(
+        port,
+        "/followup",
+        {"question": "这个问题先别跑", "rounds": 1, "mock": True},
+    )
+    assert res["ok"], res
+
+    assert _post(port, "/stop", {})["ok"] is True
+    notice = _wait_for(q, "notice")
+    assert "成果文件没有被改动" in notice["text"]
+    assert _wait_for(q, "done")
+    assert server.job.finished.wait(2)
+
+    after = {path: path.read_bytes() for path in server.out_dir.glob("*")}
+    assert after == before
+
+
+def test_page_boot_has_followup_limits(live_server):
+    _, port = live_server
+    html = _get(port, "/")
+    boot = json.loads(re.search(r"const BOOT = (.*?);\n", html).group(1))
+    assert boot["minFollowup"] == launcher.MIN_FOLLOWUP_QUESTION
+    assert boot["maxFollowup"] == launcher.MAX_FOLLOWUP_QUESTION
+    assert boot["maxFollowupTitle"] == launcher.MAX_TITLE
+
+
+# ---------------------------------------------------------------------------
+# 材料 + 用户目的：材料只是参考
+# ---------------------------------------------------------------------------
+
+
+def test_forge_with_material_and_a_seed_uses_the_users_purpose(live_server):
+    server, port = live_server
+    q = server.bus.subscribe()
+
+    res = _post(
+        port,
+        "/forge",
+        {
+            "material": "一些和颈椎有关的参考资料。",
+            "files": ["ref.md"],
+            "purpose": "给刚上班、每天坐十小时的程序员写一份能照做的颈椎保养手册。",
+            "title": "我的颈椎手册",
+            "materialMode": "seed",
+            "topics": 2,
+            "mock": True,
+        },
+    )
+    assert res["ok"], res
+    assert res["seeded"] is True
+    assert res["materialMode"] == "seed"
+
+    start = _wait_for(q, "forge_start")
+    assert start["seeded"] is True
+    assert start["materialMode"] == "seed"
+    distilled = _wait_for(q, "material_distilled")
+    assert distilled["seeded"] is True
+
+    event = _wait_for(q, "forge_done")
+    assert event["blueprint"]["title"] == "我的颈椎手册"
+    assert "具体化" in event["blueprint"]["purpose"]["text"]
+    assert _wait_for(q, "done")
+    assert server.job.finished.wait(2)
+
+
+def test_forge_with_material_seed_mode_requires_a_purpose(live_server):
+    server, port = live_server
+    res = _post(
+        port,
+        "/forge",
+        {"material": "一些参考材料", "materialMode": "seed", "mock": True},
+    )
+    assert res["ok"] is False
+    assert "先写一个目的" in res["why"]
+    assert server.bus._history == []
+
+
+def test_forge_material_distill_mode_ignores_the_provided_purpose(live_server):
+    server, port = live_server
+    q = server.bus.subscribe()
+
+    res = _post(
+        port,
+        "/forge",
+        {
+            "material": "一些参考材料",
+            "purpose": "给刚上班、每天坐十小时的程序员写一份能照做的手册。",
+            "materialMode": "distill",
+            "topics": 2,
+            "mock": True,
+        },
+    )
+    assert res["ok"], res
+    assert res["seeded"] is False
+    assert _wait_for(q, "forge_start")["seeded"] is False
+    event = _wait_for(q, "forge_done")
+    assert event["blueprint"]["title"] == "模拟材料对谈手册"
+    assert "从拖入材料提炼出的目的" in event["blueprint"]["purpose"]["text"]
+    assert _wait_for(q, "done")
+    assert server.job.finished.wait(2)
+
+
+# ---------------------------------------------------------------------------
+# 按部件重生成：议题 / 人格
+# ---------------------------------------------------------------------------
+
+
+def test_reforge_topics_keeps_the_purpose_title_and_personas(forged):
+    server, port, bp = forged
+    q = server.bus.subscribe()
+
+    res = _post(
+        port,
+        "/reforge",
+        {"what": "topics", "topics": 2, "mock": True},
+    )
+    assert res["ok"], res
+    assert res["what"] == "topics"
+
+    start = _wait_for(q, "reforge_start")
+    assert start["what"] == "topics"
+    event = _wait_for(q, "forge_done")
+    assert event["reforge"] is True
+    new = event["blueprint"]
+    assert new["ready"] is True
+    assert new["title"] == bp["title"]
+    assert new["purpose"] == bp["purpose"]
+    assert [p["name"] for p in new["personas"]] == [
+        p["name"] for p in bp["personas"]
+    ]
+    assert new["topics"]
+    assert _wait_for(q, "done")
+    assert server.job.finished.wait(2)
+
+    # 新蓝图落盘，旧蓝图文件仍然在
+    files = list(server.blueprint_dir.glob("*.json"))
+    assert len(files) >= 2
+    assert _get_json(port, "/blueprint")["title"] == bp["title"]
+
+
+def test_reforge_personas_keeps_the_purpose_and_title(forged):
+    server, port, bp = forged
+    q = server.bus.subscribe()
+
+    res = _post(
+        port,
+        "/reforge",
+        {
+            "what": "personas",
+            "people": 3,
+            "personas": [{}, {}, {}],
+            "mock": True,
+        },
+    )
+    assert res["ok"], res
+
+    start = _wait_for(q, "reforge_start")
+    assert start["people"] == 3
+    event = _wait_for(q, "forge_done")
+    new = event["blueprint"]
+    assert new["people"] == 3
+    assert new["title"] == bp["title"]
+    assert new["purpose"] == bp["purpose"]
+    assert new["topics"]
+    assert _wait_for(q, "done")
+    assert server.job.finished.wait(2)
+
+
+def test_reforge_requires_a_blueprint(live_server):
+    server, port = live_server
+    res = _post(port, "/reforge", {"what": "topics", "mock": True})
+    assert res["ok"] is False
+    assert "还没有蓝图" in res["why"]
+    assert server.bus._history == []
+
+
+def test_reforge_rejects_an_unknown_target(forged):
+    _, port, _ = forged
+    res = _post(port, "/reforge", {"what": "purpose", "mock": True})
+    assert res["ok"] is False
+    assert "topics 或 personas" in res["why"]
+
+
+def test_a_second_reforge_is_rejected_while_a_job_is_running(forged):
+    server, port, _ = forged
+    server.job = _NeverFinishes()
+    res = _post(port, "/reforge", {"what": "topics", "mock": True})
+    assert res["ok"] is False
+    assert "已经有一轮" in res["why"]
