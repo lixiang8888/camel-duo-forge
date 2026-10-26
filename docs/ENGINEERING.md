@@ -253,6 +253,9 @@ AI 尽量点名落实，人数对不上时自行合并或补齐。逐位设置�
 - `what="personas"`：重新调 `forge_personas`（可带 `PersonaPlan`，手写 / 给方向
   的位置因此能保留），并**连带重生成议题**——议题是围绕这组人写的，只换人不换题
   会让议题和人格对不上。
+- `topic_hint` / `persona_hint` 是用户在页面上写的「这次想要什么」：前者拼进
+  `forge_topics` 的提示词，后者拼进 `forge_personas` 的提示词。它们只影响这一次
+  生成，**不写进蓝图**；空串时提示词与原来逐字一致。上限 `MAX_REFORGE_HINT = 500`。
 - 议题数默认保持 `len(bp.topics)`；想改才显式传 `topic_count`。
 - 新蓝图另存一份（`save_bundle` 的时间戳文件），旧蓝图不覆盖；`origin` 按这一轮
   实际用的后端传，否则页面上的「模拟生成」标记会说谎。
@@ -552,19 +555,19 @@ tiktoken 会去 `openaipublic.blob.core.windows.net` **下载**——那个域�
 uv run pytest
 ```
 
-338 条，全部离线（用的是模拟后端，不花钱、不联网）。九个文件各管一层：
+350 条，全部离线（用的是模拟后端，不花钱、不联网）。九个文件各管一层：
 
 | 文件 | 管什么 |
 |---|---|
-| `tests/test_authoring.py` | JSON 抽取、字段校验、重试、2 人一次调用、3–5 人骨架 + 展开、团队要求、手写槽位、材料提炼、目的 + 材料具体化、按部件重生成 |
+| `tests/test_authoring.py` | JSON 抽取、字段校验、重试、2 人一次调用、3–5 人骨架 + 展开、团队要求、手写槽位、材料提炼、目的 + 材料具体化、按部件重生成与重生成要求 |
 | `tests/test_blueprint.py` | JSON 往返、format 1 自动升级、2–5 人、角色、重名、给人看的那份、`--only` 语义、围栏 |
 | `tests/test_personas.py` | 自定义人格的解析矩阵：mode、人数、数组/旧键、角色名、团队要求、长度、纪律标记 |
 | `tests/test_purpose.py` | 目的的长度边界、从文件读、标题行 |
 | `tests/test_society.py` | 2/3 人轮次与顺序、全员收手、单人反对继续、记录与拼装、最终统一轮、分歧标记 |
 | `tests/test_pipeline_run.py` | 端到端跑一遍：2/3 人落盘、钩子、收手开关、整理环节拿到人数、统一轮的触发/关闭/落盘 |
 | `tests/test_followup.py` | 追加/反复、提问插在标题下、免责声明保持最后、一次性的成果上下文、统一轮、停止/空整理不改文件、追问 → 议题截断 |
-| `tests/test_launcher.py` | 广播、HTTP 路由、两段式准入、人数/团队要求、材料提炼与「材料 + 目的」、重生成议题/人格、多人事件、统一事件、追加讨论事件与反复、keep-alive、停止不写文件 |
-| `tests/test_cli.py` | 五个子命令跑得通，`--people` / `--team-hint` / 人格数组，重生成议题/人格，追加讨论的反复与标题，参数给错时报的是人话 |
+| `tests/test_launcher.py` | 广播、HTTP 路由、两段式准入、人数/团队要求、材料提炼与「材料 + 目的」、重生成议题/人格与自定义要求、多人事件、统一事件、追加讨论事件与反复、keep-alive、停止不写文件 |
+| `tests/test_cli.py` | 五个子命令跑得通，`--people` / `--team-hint` / 人格数组，重生成议题/人格与 `--hint`，追加讨论的反复与标题，参数给错时报的是人话 |
 
 几条值得知道的：
 
@@ -670,7 +673,7 @@ daemon worker 线程：同步调用 authoring / pipeline
 | `forge_start` | `people`、`material`（有没有拖材料）、`files`、`seeded`（材料是不是只作参考）、`materialMode` |
 | `forge_stage` | `stage`：`distill` / `personas` / `topics` |
 | `material_distilled` | `title`、`purpose`、`files`、`seeded` |
-| `reforge_start` | `what`（`topics` / `personas`）、`title`、`people`、`topics`、`mock` |
+| `reforge_start` | `what`（`topics` / `personas`）、`title`、`people`、`topics`、`hint`、`mock` |
 | `reforge_cancelled` | 取消后的提示文本；旧蓝图保持可用 |
 | `run_start` | `people`、`personas`（数组，含 `name/role/title/stance/position`） |
 | `turn` | `side` 是 `s0`…`s4`（按蓝图顺序，不是固定的 a/b）、`role` |

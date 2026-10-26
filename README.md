@@ -37,8 +37,10 @@ uv run duo-forge followup --blueprint blueprints/xxx.json \
 对生成出来的议题或专家不满意，也可以只重生成其中一部分：
 
 ```bash
-uv run duo-forge reforge --blueprint blueprints/xxx.json --what topics
-uv run duo-forge reforge --blueprint blueprints/xxx.json --what personas --people 3
+uv run duo-forge reforge --blueprint blueprints/xxx.json --what topics \
+  --hint "议题更偏执行、少谈理论"
+uv run duo-forge reforge --blueprint blueprints/xxx.json --what personas --people 3 \
+  --hint "换一位能算成本的把关人"
 ```
 
 网页端拖入材料时，如果文件不是一段目的（参考文献、笔记、手册），先在上面写一句

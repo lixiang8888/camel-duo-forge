@@ -403,6 +403,16 @@ uv run python make_shortcut.py
 「重生成人格」会用第 1 步里的人格草稿：`manual` / `hint` 位置保留你写的设定，
 `auto` 位置重新生成。想换人数，就在第 1 步改「对话人数」再点重生成。
 
+按钮上方有一个**「重生成要求」**输入框（可选，最多 500 字）。点哪个按钮，
+这段要求就作用于哪个目标：
+
+- **重生成议题**：要求进选题提示词，例如「议题更偏执行、少谈理论」；
+- **重生成人格**：要求作为这一轮的换人 / 分工要求，例如「换一位成本把关人」，
+  同时仍然沿用第 1 步的逐位设置；
+- 留空就是让模型自由重生成。
+
+这段要求只影响这一次生成，**不写进蓝图**；下一次重生成不会自动带上它。
+
 ### 目的怎么重新生成
 
 目的没有单独的「重生成」按钮，因为它本身就是第 1 步的输入：
@@ -419,8 +429,13 @@ uv run python make_shortcut.py
 # 只换一批议题，人格和目的都不动
 uv run duo-forge reforge --blueprint blueprints/xxx.json --what topics
 
+# 给这次议题一个方向
+uv run duo-forge reforge --blueprint blueprints/xxx.json --what topics \
+  --hint "议题更偏执行、少谈理论"
+
 # 换一批专家（连带重生成议题），人数、手写人格、团队要求都可以重新给
-uv run duo-forge reforge --blueprint blueprints/xxx.json --what personas --people 3
+uv run duo-forge reforge --blueprint blueprints/xxx.json --what personas --people 3 \
+  --hint "换一位能算成本的把关人"
 uv run duo-forge reforge --blueprint blueprints/xxx.json --what personas \
   --personas-file personas.json --team-hint "要有一个一线医生、一个患者、一个管理者"
 ```
@@ -429,6 +444,7 @@ uv run duo-forge reforge --blueprint blueprints/xxx.json --what personas \
 |---|---|
 | `--blueprint` | 要改的蓝图 |
 | `--what` | `topics`（只换议题）或 `personas`（换人格并连带换议题） |
+| `--hint` | 这次重生成的额外要求，最多 500 字；`topics` 进选题提示词，`personas` 作为换人/分工要求 |
 | `--topics` | 重新生成几个议题；默认保持蓝图里现有的数量 |
 | `--people` / `--personas-file` / `--team-hint` | 只在 `--what personas` 时可用 |
 | `--out` | 新蓝图输出目录，默认 `blueprints/` |
