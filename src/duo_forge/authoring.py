@@ -64,6 +64,7 @@ from .topics import (
     MAX_BRIEF,
     MAX_GOAL,
     MAX_OPENING,
+    MAX_REFORGE_HINT,
     MAX_SECTION_TITLE,
     MAX_TOPICS,
     Topic,
@@ -354,8 +355,17 @@ TOPICS_PROMPT = """目的：
 参与对谈的专家（共 {people} 位，顺序即发言顺序）：
 
 {personas}
-
+{hint_block}
 请设计 {count} 个议题，按他们对谈的先后顺序排列。只输出那个 JSON 对象。"""
+
+#: 重生成时用户写的那段要求。空串时整块消失，原有提示词一字不变。
+TOPICS_HINT_BLOCK = """
+【本次对议题的额外要求】
+{hint}
+这是强偏好：在不违反上面选题标准的前提下，尽量落实这些要求。它不能替代
+「专家们会被迫表态的具体分歧点」这条底线；如果要求太宽泛，就按它选方向，
+但仍然要选出能吵起来的具体问题。
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -919,8 +929,25 @@ def distill_material(
     return Purpose(text=made.text, title=seed.title) if seed.title else made
 
 
+def _extra_hint_block(extra_hint: str) -> str:
+    """重生成人格时用户写的一句要求。空串时整块消失，提示词不变。"""
+    text = (extra_hint or "").strip()
+    if not text:
+        return ""
+    return (
+        "\n\n【本次重生成要求】\n"
+        f"{text}\n"
+        "这是强偏好：在不违反上面人格设计原则的前提下，尽量落实；"
+        "人数固定、称呼和角色名不能重复这些硬约束不变。"
+    )
+
+
 def forge_personas(
-    purpose: Purpose, *, backend, plan: PersonaPlan | None = None
+    purpose: Purpose,
+    *,
+    backend,
+    plan: PersonaPlan | None = None,
+    extra_hint: str = "",
 ) -> ForgedPersonas:
     """按目的生成 N 位参与者（外加大标题）。
 
@@ -929,6 +956,7 @@ def forge_personas(
     - 三人及以上：先一次团队骨架，再一次展开全部人格。
 
     `plan` 里标记为 `manual` 的位置不交给模型。
+    `extra_hint` 是重生成时用户写的一句额外要求，只进提示词，不写进蓝图。
     """
     plan = plan or PersonaPlan()
     if plan.all_manual:
@@ -943,7 +971,7 @@ def forge_personas(
         )
 
     hint = PERSONA_TITLE_HINT.format(title=purpose.title) if purpose.title else ""
-    plan_block = _plan_prompt_block(plan)
+    plan_block = _plan_prompt_block(plan) + _extra_hint_block(extra_hint)
 
     if plan.people == 2:
         prompt = PERSONA_PROMPT.format(purpose=purpose.text, title_hint=hint)
@@ -992,8 +1020,12 @@ def forge_topics(
     *,
     backend,
     count: int = DEFAULT_TOPIC_COUNT,
+    hint: str = "",
 ) -> tuple[Topic, ...]:
     """按目的和这组专家，生成一组他们会真的吵起来的议题。
+
+    `hint` 是重生成时用户写的一句要求（例如「更偏执行、少谈理论」）。
+    它只进提示词，不写进蓝图；空串时提示词与原来完全一致。
 
     注意这里**只生成正文议题**，收尾议题由 `topics.closing_topic` 按代码造
     （它的输入是前面全部对话，形状和普通议题不一样，见那个函数的说明）。
@@ -1006,11 +1038,13 @@ def forge_topics(
             f"第 {index} 位（{position}）：{persona.name}（{persona.title}），"
             f"角色「{persona.display_role}」，负责「{persona.stance}」"
         )
+    hint_block = TOPICS_HINT_BLOCK.format(hint=hint.strip()) if hint.strip() else ""
     prompt = TOPICS_PROMPT.format(
         purpose=purpose.text,
         people=people,
         personas="\n".join(lines),
         count=count,
+        hint_block=hint_block,
     )
     agent = ChatAgent(system_message=TOPICS_SYSTEM, model=backend)
     return _ask_json(agent, prompt, _parse_topics, what="议题")
@@ -1112,13 +1146,18 @@ def reforge_blueprint(
     what: str,
     topic_count: int | None = None,
     plan: PersonaPlan | None = None,
+    topic_hint: str = "",
+    persona_hint: str = "",
     origin: str = "",
 ) -> "Blueprint":
     """只重生成蓝图的一部分，保留其余部分。
 
     - `what="topics"`：目的、标题、slug、人格都不动，只重新选题。
+      `topic_hint` 是这次选题的额外要求（例如「更偏执行、少谈理论」）。
     - `what="personas"`：重新生成人格；因为议题是围绕这组人格生成的，
       所以议题**连带重生成**。目的、标题、slug 不动。
+      `persona_hint` 是这次换人的额外要求（例如「换一位成本把关人」）；
+      新议题围绕新人格生成，不重复塞这段要求。
 
     `topic_count` 默认保持蓝图里现有的议题数，避免「只想换一批议题」时
     数量也跟着变。`origin` 由调用方按这一轮实际用的后端传（mock / model），
@@ -1131,6 +1170,19 @@ def reforge_blueprint(
             f"不支持只重生成「{what}」：只能是 topics 或 personas。"
         )
 
+    topic_hint = (topic_hint or "").strip()
+    persona_hint = (persona_hint or "").strip()
+    if len(topic_hint) > MAX_REFORGE_HINT:
+        raise AuthoringError(
+            f"议题重生成要求太长：上限 {MAX_REFORGE_HINT} 字，"
+            f"收到 {len(topic_hint)} 字。"
+        )
+    if len(persona_hint) > MAX_REFORGE_HINT:
+        raise AuthoringError(
+            f"人格重生成要求太长：上限 {MAX_REFORGE_HINT} 字，"
+            f"收到 {len(persona_hint)} 字。"
+        )
+
     count = len(blueprint.topics) if topic_count is None else topic_count
     count = max(1, min(MAX_TOPICS, int(count)))
 
@@ -1140,6 +1192,7 @@ def reforge_blueprint(
             blueprint.personas,
             backend=backend,
             count=count,
+            hint=topic_hint,
         )
         return Blueprint(
             purpose=blueprint.purpose,
@@ -1151,9 +1204,17 @@ def reforge_blueprint(
         )
 
     plan = plan or PersonaPlan(people=blueprint.people)
-    forged = forge_personas(blueprint.purpose, backend=backend, plan=plan)
+    forged = forge_personas(
+        blueprint.purpose,
+        backend=backend,
+        plan=plan,
+        extra_hint=persona_hint,
+    )
     topics = forge_topics(
-        blueprint.purpose, forged.personas, backend=backend, count=count
+        blueprint.purpose,
+        forged.personas,
+        backend=backend,
+        count=count,
     )
     return Blueprint(
         purpose=blueprint.purpose,

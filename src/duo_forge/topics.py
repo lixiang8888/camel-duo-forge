@@ -37,6 +37,10 @@ MAX_FOLLOWUP_QUESTION = 2000
 #: 不参与任何业务判断。
 FOLLOWUP_KEY_PREFIX = "followup"
 
+#: 重生成议题 / 人格时用户写的那段「这次想要什么」。它只进这一次生成的提示词，
+#: 不写进蓝图；上限和团队要求同一量级。
+MAX_REFORGE_HINT = 500
+
 MAX_TOPICS = 12
 
 #: 默认生成几个正文议题（不含自动追加的收尾议题）。

@@ -26,7 +26,7 @@ from duo_forge.personas import (
     parse_persona_plan,
 )
 from duo_forge.purpose import MAX_MATERIAL, MAX_PURPOSE, Purpose
-from duo_forge.topics import MAX_TOPICS
+from duo_forge.topics import MAX_REFORGE_HINT, MAX_TOPICS
 
 
 @pytest.fixture
@@ -736,7 +736,7 @@ def test_reforge_topics_keeps_purpose_title_personas(blueprint, monkeypatch):
     calls: dict[str, int] = {}
     real = authoring.forge_topics
 
-    def spy(purpose, personas, *, backend, count):
+    def spy(purpose, personas, *, backend, count, hint=""):
         calls["count"] = count
         return real(purpose, personas, backend=backend, count=count)
 
@@ -765,11 +765,11 @@ def test_reforge_personas_also_regenerates_topics(blueprint, monkeypatch):
     real_personas = authoring.forge_personas
     real_topics = authoring.forge_topics
 
-    def spy_personas(purpose, *, backend, plan=None):
+    def spy_personas(purpose, *, backend, plan=None, extra_hint=""):
         calls["personas"] += 1
         return real_personas(purpose, backend=backend, plan=plan)
 
-    def spy_topics(purpose, personas, *, backend, count):
+    def spy_topics(purpose, personas, *, backend, count, hint=""):
         calls["topics"] += 1
         return real_topics(purpose, personas, backend=backend, count=count)
 
@@ -815,3 +815,97 @@ def test_reforge_rejects_an_unknown_target(blueprint):
             blueprint, backend=ScriptedAuthorBackend(), what="purpose"
         )
     assert "topics 或 personas" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# 重生成时的自定义要求
+# ---------------------------------------------------------------------------
+
+
+def test_forge_topics_sends_the_reforge_hint(purpose, personas):
+    backend = RecordingAuthorBackend()
+
+    forge_topics(
+        purpose,
+        personas,
+        backend=backend,
+        count=2,
+        hint="UNIQUE_TOPIC_HINT_5a3f：议题更偏执行、少谈理论。",
+    )
+
+    prompt = backend.seen_prompts[0]
+    assert "UNIQUE_TOPIC_HINT_5a3f" in prompt
+    assert "本次对议题的额外要求" in prompt
+
+
+def test_forge_topics_without_a_hint_keeps_the_prompt_clean(purpose, personas):
+    backend = RecordingAuthorBackend()
+
+    forge_topics(purpose, personas, backend=backend, count=2)
+
+    assert "本次对议题的额外要求" not in backend.seen_prompts[0]
+
+
+def test_forge_personas_sends_the_reforge_hint(purpose):
+    backend = RecordingAuthorBackend()
+
+    forge_personas(
+        purpose,
+        backend=backend,
+        extra_hint="UNIQUE_PERSONA_HINT_7b21：换一位成本把关人。",
+    )
+
+    prompt = backend.seen_prompts[0]
+    assert "UNIQUE_PERSONA_HINT_7b21" in prompt
+    assert "本次重生成要求" in prompt
+
+
+def test_reforge_topics_passes_the_hint(blueprint, monkeypatch):
+    seen: dict[str, str] = {}
+    real = authoring.forge_topics
+
+    def spy(purpose, personas, *, backend, count, hint=""):
+        seen["hint"] = hint
+        return real(purpose, personas, backend=backend, count=count)
+
+    monkeypatch.setattr(authoring, "forge_topics", spy)
+
+    authoring.reforge_blueprint(
+        blueprint,
+        backend=ScriptedAuthorBackend(),
+        what="topics",
+        topic_hint="议题更偏执行",
+    )
+
+    assert seen["hint"] == "议题更偏执行"
+
+
+def test_reforge_personas_passes_the_hint(blueprint, monkeypatch):
+    seen: dict[str, str] = {}
+    real = authoring.forge_personas
+
+    def spy(purpose, *, backend, plan=None, extra_hint=""):
+        seen["hint"] = extra_hint
+        return real(purpose, backend=backend, plan=plan)
+
+    monkeypatch.setattr(authoring, "forge_personas", spy)
+
+    authoring.reforge_blueprint(
+        blueprint,
+        backend=ScriptedAuthorBackend(),
+        what="personas",
+        persona_hint="换一位成本把关人",
+    )
+
+    assert seen["hint"] == "换一位成本把关人"
+
+
+def test_reforge_rejects_an_overlong_hint(blueprint):
+    with pytest.raises(AuthoringError) as excinfo:
+        authoring.reforge_blueprint(
+            blueprint,
+            backend=ScriptedAuthorBackend(),
+            what="topics",
+            topic_hint="长" * (MAX_REFORGE_HINT + 1),
+        )
+    assert "重生成要求太长" in str(excinfo.value)

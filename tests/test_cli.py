@@ -12,6 +12,7 @@ import pytest
 
 from duo_forge import blueprint as blueprint_mod
 from duo_forge.cli import main
+from duo_forge.topics import MAX_REFORGE_HINT
 
 PURPOSE = "给刚上班、每天坐十小时的程序员写一份颈椎保养手册，要能真的照做。"
 
@@ -663,3 +664,46 @@ def test_reforge_with_a_missing_blueprint_is_refused(tmp_path, capsys):
     )
     assert code == 2
     assert "读不出蓝图" in capsys.readouterr().err
+
+
+def test_reforge_passes_the_hint_to_the_target(tmp_path, monkeypatch):
+    from duo_forge import authoring
+
+    captured: dict[str, object] = {}
+    real = authoring.reforge_blueprint
+
+    def spy(base, **kwargs):
+        captured.update(kwargs)
+        return real(base, **kwargs)
+
+    monkeypatch.setattr(authoring, "reforge_blueprint", spy)
+    _forge(tmp_path)
+    bp_path = next(tmp_path.glob("*.json"))
+    out = tmp_path / "reforged"
+
+    assert (
+        main(
+            [
+                "reforge", "--blueprint", str(bp_path), "--what", "topics",
+                "--hint", "议题更偏执行", "--mock", "--out", str(out),
+            ]
+        )
+        == 0
+    )
+
+    assert captured["topic_hint"] == "议题更偏执行"
+    assert captured["persona_hint"] == ""
+
+
+def test_reforge_rejects_an_overlong_hint(tmp_path, capsys):
+    _forge(tmp_path)
+    bp_path = next(tmp_path.glob("*.json"))
+
+    code = main(
+        [
+            "reforge", "--blueprint", str(bp_path), "--what", "topics",
+            "--hint", "长" * (MAX_REFORGE_HINT + 1), "--mock",
+        ]
+    )
+    assert code == 2
+    assert "重生成要求" in capsys.readouterr().err

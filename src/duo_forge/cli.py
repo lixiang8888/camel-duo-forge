@@ -37,7 +37,7 @@ from .personas import (
     parse_team_hint,
 )
 from .purpose import InvalidPurpose, Purpose, make_purpose, read_purpose_file
-from .topics import DEFAULT_TOPIC_COUNT, MAX_TOPICS
+from .topics import DEFAULT_TOPIC_COUNT, MAX_REFORGE_HINT, MAX_TOPICS
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +242,13 @@ def _cmd_reforge(args: argparse.Namespace) -> int:
         except PersonaSpecError as exc:
             return _fail("人格设定有问题", exc)
 
+    hint = (args.hint or "").strip()
+    if len(hint) > MAX_REFORGE_HINT:
+        return _fail(
+            "重生成要求太长",
+            f"上限 {MAX_REFORGE_HINT} 字，收到 {len(hint)} 字。",
+        )
+
     count = args.topics if args.topics is not None else len(bp.topics)
     count = max(1, min(MAX_TOPICS, count))
     target = "议题" if args.what == "topics" else "人格 + 议题"
@@ -251,6 +258,8 @@ def _cmd_reforge(args: argparse.Namespace) -> int:
         calls = 2 if (plan.people if plan else bp.people) == 2 else 3
     print(f"用蓝图：{args.blueprint}")
     print(f"保留：目的《{bp.title}》和标题；重新生成：{target}")
+    if hint:
+        print(f"额外要求：{hint}")
     print(f"这条路径最多 {calls} 次模型调用")
     if args.mock:
         print("!! 模拟模式：重新生成的内容是占位内容，没有参考价值。")
@@ -263,6 +272,8 @@ def _cmd_reforge(args: argparse.Namespace) -> int:
             what=args.what,
             topic_count=count,
             plan=plan,
+            topic_hint=hint if args.what == "topics" else "",
+            persona_hint=hint if args.what == "personas" else "",
             origin="mock" if args.mock else "model",
         )
     except MissingApiKey as exc:
@@ -644,6 +655,14 @@ def main(argv: list[str] | None = None) -> int:
         help="重生成议题（保留人格），或重生成人格（连带重生成议题）",
     )
     _add_persona_args(reforge)
+    reforge.add_argument(
+        "--hint", default="",
+        help=(
+            "这次重生成的额外要求，最多 "
+            f"{MAX_REFORGE_HINT} 字。--what topics 时进选题提示词；"
+            "--what personas 时作为换人/分工要求"
+        ),
+    )
     reforge.add_argument(
         "--topics", type=int, default=None,
         help="重新生成几个议题（默认保持蓝图里现有的数量）",
