@@ -1178,3 +1178,88 @@ def test_a_second_reforge_is_rejected_while_a_job_is_running(forged):
     res = _post(port, "/reforge", {"what": "topics", "mock": True})
     assert res["ok"] is False
     assert "已经有一轮" in res["why"]
+
+
+def test_reforge_passes_the_hint_to_the_selected_target(forged, monkeypatch):
+    from duo_forge import authoring
+
+    captured: dict[str, object] = {}
+    real = authoring.reforge_blueprint
+
+    def spy(base, **kwargs):
+        captured.update(kwargs)
+        return real(base, **kwargs)
+
+    monkeypatch.setattr(authoring, "reforge_blueprint", spy)
+    server, port, _ = forged
+    q = server.bus.subscribe()
+
+    res = _post(
+        port,
+        "/reforge",
+        {"what": "topics", "hint": "议题更偏执行、少谈理论", "mock": True},
+    )
+    assert res["ok"], res
+    assert res["hint"] == "议题更偏执行、少谈理论"
+    assert _wait_for(q, "reforge_start")["hint"] == "议题更偏执行、少谈理论"
+    assert _wait_for(q, "forge_done")
+    assert _wait_for(q, "done")
+    assert server.job.finished.wait(2)
+
+    assert captured["topic_hint"] == "议题更偏执行、少谈理论"
+    assert captured["persona_hint"] == ""
+
+
+def test_reforge_personas_uses_the_hint_for_personas(forged, monkeypatch):
+    from duo_forge import authoring
+
+    captured: dict[str, object] = {}
+    real = authoring.reforge_blueprint
+
+    def spy(base, **kwargs):
+        captured.update(kwargs)
+        return real(base, **kwargs)
+
+    monkeypatch.setattr(authoring, "reforge_blueprint", spy)
+    server, port, _ = forged
+    q = server.bus.subscribe()
+
+    res = _post(
+        port,
+        "/reforge",
+        {
+            "what": "personas",
+            "people": 3,
+            "personas": [{}, {}, {}],
+            "hint": "换一位成本把关人",
+            "mock": True,
+        },
+    )
+    assert res["ok"], res
+    assert _wait_for(q, "forge_done")
+    assert _wait_for(q, "done")
+    assert server.job.finished.wait(2)
+
+    assert captured["persona_hint"] == "换一位成本把关人"
+    assert captured["topic_hint"] == ""
+
+
+def test_reforge_rejects_an_overlong_hint(forged):
+    server, port, _ = forged
+    history = list(server.bus._history)
+
+    res = _post(
+        port,
+        "/reforge",
+        {"what": "topics", "hint": "长" * (launcher.MAX_REFORGE_HINT + 1), "mock": True},
+    )
+    assert res["ok"] is False
+    assert "重生成要求" in res["why"]
+    assert server.bus._history == history
+
+
+def test_page_boot_has_reforge_hint_limit(live_server):
+    _, port = live_server
+    html = _get(port, "/")
+    boot = json.loads(re.search(r"const BOOT = (.*?);\n", html).group(1))
+    assert boot["maxReforgeHint"] == launcher.MAX_REFORGE_HINT

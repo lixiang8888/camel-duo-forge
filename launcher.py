@@ -107,6 +107,7 @@ from duo_forge.topics import (
     CONVERGENCE_KEY,
     DEFAULT_TOPIC_COUNT,
     MAX_FOLLOWUP_QUESTION,
+    MAX_REFORGE_HINT,
     MAX_TOPICS,
     MIN_FOLLOWUP_QUESTION,
     closing_topic,
@@ -758,6 +759,7 @@ class _ReforgeJob(_Job):
         what: str,
         count: int,
         plan: Optional[PersonaPlan],
+        hint: str,
         mock: bool,
     ) -> None:
         super().__init__(server.bus)
@@ -766,6 +768,7 @@ class _ReforgeJob(_Job):
         self.what = what
         self.count = count
         self.plan = plan
+        self.hint = hint
         self.mock = mock
 
     def _cancelled_or_superseded(self) -> bool:
@@ -788,6 +791,7 @@ class _ReforgeJob(_Job):
                 title=self.base.title,
                 people=self.plan.people if self.plan else self.base.people,
                 topics=self.count,
+                hint=self.hint,
                 mock=self.mock,
             )
             backend = build_author_backend(mock=self.mock)
@@ -797,6 +801,8 @@ class _ReforgeJob(_Job):
                 what=self.what,
                 topic_count=self.count,
                 plan=self.plan if self.what == "personas" else None,
+                topic_hint=self.hint if self.what == "topics" else "",
+                persona_hint=self.hint if self.what == "personas" else "",
                 origin="mock" if self.mock else "model",
             )
             if self._cancel_if_needed():
@@ -1182,6 +1188,20 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         mock = bool(body.get("mock"))
+        raw_hint = body.get("hint")
+        hint = raw_hint.strip() if isinstance(raw_hint, str) else ""
+        if len(hint) > MAX_REFORGE_HINT:
+            self._json(
+                {
+                    "ok": False,
+                    "why": (
+                        f"重生成要求太长了：上限 {MAX_REFORGE_HINT} 字，"
+                        f"收到 {len(hint)} 字。"
+                    ),
+                }
+            )
+            return
+
         raw_count = body.get("topics")
         count = 0
         if raw_count is not None:
@@ -1217,6 +1237,7 @@ class _Handler(BaseHTTPRequestHandler):
                 what=what,
                 count=count,
                 plan=plan,
+                hint=hint,
                 mock=mock,
             )
             server.job = job
@@ -1228,6 +1249,7 @@ class _Handler(BaseHTTPRequestHandler):
                 "ok": True,
                 "what": what,
                 "topics": count,
+                "hint": hint,
                 "mock": mock,
             }
         )
@@ -1512,6 +1534,7 @@ def _boot_payload(server: _Server) -> dict:
         "minFollowup": MIN_FOLLOWUP_QUESTION,
         "maxFollowup": MAX_FOLLOWUP_QUESTION,
         "maxFollowupTitle": MAX_TITLE,
+        "maxReforgeHint": MAX_REFORGE_HINT,
         "closing": {
             "key": CLOSING_KEY,
             "title": closing_topic(0).section_title,
@@ -1568,6 +1591,7 @@ _PAGE = r"""<!DOCTYPE html>
   #title { width: 210px; }
   #followupQuestion { width: 100%; min-height: 70px; resize: vertical; }
   #followupTitle { width: 280px; }
+  #reforgeRequirement { width: 100%; min-height: 52px; resize: vertical; margin-top: 6px; }
   .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .row .spacer { flex: 1; }
   .row + .row { margin-top: 9px; }
@@ -1769,6 +1793,11 @@ _PAGE = r"""<!DOCTYPE html>
     <div class="topics" id="topics"></div>
     <div class="row">
       <span style="font-size:13px">对这批结果不满意？</span>
+      <span class="spacer"></span>
+    </div>
+    <textarea id="reforgeRequirement"
+      placeholder="可选：这次想要什么？例如「议题更偏执行、少谈理论」；点「重生成人格」时可以写「换一位成本把关人」。"></textarea>
+    <div class="row">
       <button type="button" id="reforgeTopicsBtn">重生成议题</button>
       <button type="button" id="reforgePersonasBtn">重生成人格 + 议题</button>
       <span class="spacer"></span>
@@ -1872,6 +1901,7 @@ $("forgeMock").checked = !!BOOT.mockDefault;
 $("runMock").checked = !!BOOT.mockDefault;
 $("followupQuestion").maxLength = BOOT.maxFollowup;
 $("followupTitle").maxLength = BOOT.maxFollowupTitle;
+$("reforgeRequirement").maxLength = BOOT.maxReforgeHint;
 
 // ---- 目的草稿：只防刷新丢失，不是数据源 ----
 const PSTORE = "duo-forge-purpose";
@@ -2339,7 +2369,7 @@ const LOCKED_WHILE_RUNNING = [
   "forgeBtn", "purpose", "title", "people", "teamHint", "topicCount", "forgeMock",
   "pickFiles", "fileInput", "materialMode", "materialForgeBtn", "materialClearBtn",
   "runBtn", "rounds", "converge", "runMock",
-  "reforgeTopicsBtn", "reforgePersonasBtn",
+  "reforgeRequirement", "reforgeTopicsBtn", "reforgePersonasBtn",
   "followupBtn", "followupQuestion", "followupTitle",
 ];
 function setRunning(on) {
@@ -2997,6 +3027,7 @@ async function startReforge(what) {
   const payload = {
     what: what,
     topics: bp.topics.length,
+    hint: $("reforgeRequirement").value.trim(),
     mock: $("forgeMock").checked,
   };
   if (what === "personas") {
