@@ -39,6 +39,12 @@
               │
               ▼
    transcript-*.md   handbook-*.md   quick-*.md
+              │
+              ▼
+      ┌───────────────┐
+      │  followup     │  读完成果后的一个追问 → 同一批专家再谈一轮
+      │  （可反复）   │  整理成一节，插在免责声明之前
+      └───────────────┘
 ```
 
 两段之间**只通过蓝图通信**。这一刀切下去的理由是钱：`forge` 要花几次模型调用，
@@ -50,12 +56,14 @@
 src/duo_forge/
 ├── purpose.py     目的：整个项目唯一的输入
 ├── authoring.py   ★ 功能一 + 功能二：目的 → 2–5 位专家 + 一组议题
+│                  （含按部件重生成、材料提炼、目的 + 材料具体化）
 ├── blueprint.py   ★ 蓝图：format 2、旧 format 1 兼容、落盘、读回、给人看的版本
 ├── personas.py    Persona 的形状、人数/角色/团队要求的解析与校验、发言纪律
 ├── topics.py      Topic 的形状 + 长度上限 + 收尾议题 / 最终统一轮占位
 ├── society.py     ★ CAMEL 多智能体编排（2–5 位，固定轮转，最终统一轮）
 ├── digest.py      对话 → 正文/附录 → 一页速查
 ├── pipeline.py    ★ 完整流程编排
+├── followup.py    ★ 读完成果后的追加讨论（原地更新三份产物）
 ├── backends.py    离线模拟后端（含给生成环节用的那个）
 ├── config.py      模型工厂
 └── cli.py         命令行入口
@@ -64,10 +72,12 @@ src/duo_forge/
 **`authoring` 是唯一一个会让「领域」进来的地方**，其余模块全都不认识健身、颈椎、
 睡眠这些词——它们只认识 Persona / Topic / Blueprint。这条界线是泛化能成立的唯一原因。
 
-`pipeline.py` 是编排的唯一出处：`cli.py` 把它的回调接到 `print` 上。
-`authoring` 在 `cli.py` 里是**函数内 import** 的：它要拖进 camel，而
-`duo-forge show` 只读一个 JSON 文件，不该为 camel 的导入付钱。同理
-`DEFAULT_TOPIC_COUNT` 放在不拖 camel 的 `topics.py` 里。
+`pipeline.py` 是「从零跑一轮」的编排唯一出处：`cli.py` 把它的回调接到 `print` 上。
+`followup.py` 是「在已有成果上追加一节」的唯一出处，两者共用 society / digest /
+authoring，没有第二套对谈或整理逻辑。`authoring` 在 `cli.py` 里是**函数内 import**
+的：它要拖进 camel，而 `duo-forge show` 只读一个 JSON 文件，不该为 camel 的导入付钱。
+同理 `DEFAULT_TOPIC_COUNT` 放在不拖 camel 的 `topics.py` 里。`followup.py` 顶层也
+只 import 轻量模块，society / digest / authoring 都在 `run_followup` 里懒加载。
 
 ---
 
@@ -200,17 +210,55 @@ AI 尽量点名落实，人数对不上时自行合并或补齐。逐位设置�
   `{"title": ..., "distilled_purpose": ...}`。用 `distilled_purpose` 而不是
   `purpose` 当键名，是为了让 `ScriptedAuthorBackend` 能无歧义地认出这类请求。
 - 目的仍然受 `MAX_PURPOSE` 限制；超长会带着具体错误重试。材料本身受
-  `MAX_MATERIAL = 30000` 限制，但**不会**进入每个人的 system message——只有
-  提炼后的目的会。
+  `MAX_MATERIAL` 限制（默认 50000，可用 `DUO_FORGE_MAX_MATERIAL` 调整），
+  但**不会**进入每个人的 system message——只有提炼后的目的会。5 万字是给
+  默认 DeepSeek（64k 上下文）留的安全余量；使用 1M 上下文模型时可以设成
+  1000000。应用不做分块，超过模型上下文时由模型 API 报错。
 - 多个文件在浏览器里按拖入/选择顺序合并，每份前面加 `## 文件：<name>`，
   文件之间用 `---` 分隔；服务端只收到合并后的文本和文件名列表。
 - `launcher._ForgeJob` 在材料模式下先发 `forge_stage=distill`，调用
-  `distill_material`，再发 `material_distilled`（带 title/purpose/files），
+  `distill_material`，再发 `material_distilled`（带 title/purpose/files/seeded），
   之后才走正常的人格/议题流程。页面收到后回填目的和标题，并在 `forge_done`
-  时停在审阅，不自动开跑。
+  时停在审阅，不自动开始对谈。
 - 材料原文不写进蓝图；蓝图里只有提炼后的目的。想换材料就重新拖一次。
 - mock 模式下 `ScriptedAuthorBackend` 也认这个请求，返回一份占位的目的，
   所以「材料 → 目的 → 蓝图」这条链路在离线时也会被真的走一遍。
+- **长材料的正确用法不在这条链路上。** 如果材料是一份纲领加若干份细节文档，
+  不要合并后一起提炼——那样细节文档只会被压成一句目的。见
+  [`KNOWLEDGE_MOUNT.md`](KNOWLEDGE_MOUNT.md)：材料原文进蓝图，按议题检索
+  可寻址的小节注入，引用带锚点并由代码校验。
+
+### 材料 + 用户目的：只具体化，不另起
+
+材料不是目的文件时（参考文献、笔记、手册、会议记录），仅凭材料提炼出来的目的
+很容易跑偏。网页因此允许用户选「材料只是参考」，并先写一句目的：
+
+- `distill_material(..., seed=Purpose)` 走 `DISTILL_SEED_SYSTEM` / 提示词；
+  材料从「目的的来源」降级成「参考资料」，提示词明确要求不得改变用户想做的事、
+  给谁用、要什么成果，只补细节、约束、场景和数字。
+- 用户给了标题就用用户的（返回 `Purpose(title=seed.title)`）；模型起的标题只在
+  用户留空时采用。
+- 请求上用 `materialMode` 区分：`distill` 忽略目的框，`seed` 必须有合法目的。
+  旧客户端没带这个字段时，带了 `purpose` 就按 `seed` 处理，避免静默丢掉用户输入。
+- 拖入文件后**不再自动锻造**：材料先在浏览器里暂存，用户选用途、必要时补目的，
+  再点锻造。材料原文仍然不写进蓝图。
+- mock 后端用系统提示词里的「目的具体化师」认这类请求，返回
+  `_MOCK_DISTILLED_SEED`，所以这条链路离线也会被真的走一遍。
+
+### 按部件重生成
+
+`authoring.reforge_blueprint(bp, what=...)` 只换一部分，别的原样带过去：
+
+- `what="topics"`：保留 purpose / title / slug / personas，只重新调 `forge_topics`。
+- `what="personas"`：重新调 `forge_personas`（可带 `PersonaPlan`，手写 / 给方向
+  的位置因此能保留），并**连带重生成议题**——议题是围绕这组人写的，只换人不换题
+  会让议题和人格对不上。
+- 议题数默认保持 `len(bp.topics)`；想改才显式传 `topic_count`。
+- 新蓝图另存一份（`save_bundle` 的时间戳文件），旧蓝图不覆盖；`origin` 按这一轮
+  实际用的后端传，否则页面上的「模拟生成」标记会说谎。
+- 启动器的 `_ReforgeJob` 和 `/reforge` 复用 `_ForgeJob` 的准入 / 取消规则：调用
+  返回前无法掐断，返回后若已被取消或取代就丢弃。成功后复用 `forge_done` 事件，
+  页面不必再写一套蓝图渲染。
 
 ---
 
@@ -359,6 +407,48 @@ user。做法是「上一条交给下一位作为 `step` 的输入，其余人�
 > 「上下文超限」和「外部 stop_event」两种情况下为真。它现在是一条保留的安全网，
 > 不是收手机制。
 
+### 读完成果后的追加讨论（followup）
+
+`run` 的产物是定稿；读者读完之后还可能有具体追问。`followup` 不重跑原有议题，
+只把这一次追问做成**一个追加议题**，让同一批专家再谈一轮，然后把整理结果
+**原地追加**进三份产物：
+
+```
+追问 → authoring.forge_followup_topic（1 次）
+     → society.debate_topic(context=成果摘要)
+     → digest.digest_section（1 次）
+     → 仍有分歧？society.converge_history（最多 人数 次）
+     → digest.assemble_followup_convergence（代码拼，不再花调用）
+     → 插到手册免责声明之前；追加实录；digest.digest_quick(更新后的全文)（1 次）
+```
+
+几个值得记住的约束：
+
+- **追问原文进 `brief`，不交给模型概括。** `Topic.brief` 上限 400 字，所以
+  `_parse_followup_topic` 直接截断原问题；完整问题通过 `context` 一次性发给
+  所有专家。模型只负责这一节的标题、目标和开场发言。
+- **`debate_topic` 多了一个 `context` 参数。** 它作为「系统」的 user message
+  进入所有 agent 的记忆，发生在开场白之前，**不写进 transcript**（它不是任何
+  一位专家说的话）。默认 None，原有 run 的行为一字不变。
+- **上下文必须克制。** 这段 context 会留在每个 agent 的记忆里、之后每一轮
+  重发；所以对谈用的是 `digest.convergence_excerpt`（要点 + 分歧 + 附录 A +
+  已有统一结论），并再截到 `MAX_DEBATE_CONTEXT = 6000` 字。只有写开场发言的
+  那一次作者调用能看 `MAX_AUTHOR_CONTEXT = 12000` 字的全文。
+- **标题由代码兜底。** 整理提示词要求输出 `## 追加讨论 N：…`，但模型偶尔会换
+  标题，mock 更是只回占位文本。`_ensure_heading` 保证这一节始终以期望的标题
+  开头——手册结构和下一次的编号（`next_index`）都靠它。
+- **只在最后一步落盘。** 手册、实录、速查都用「临时文件 + `os.replace`」写；
+  中途被喊停、模型整理不出内容、或任何异常，三份文件都不会被改动。编号也只在
+  成功后才推进（启动器里是 `_RunJob.followup_count`）。
+- **追加编号从手册里读。** 命令行用 `followup.next_index`，数的是
+  `## 追加讨论 N：` 的最大编号而不是个数；启动器在准入时冻结编号，成功后写回。
+- **网页端是 `_FollowupJob`，不是新的 `_RunJob`。** 它成功后替换
+  `run_job.result` 的正文与路径，而不是改 `server.last_run`——`/handbook`、
+  `/quick`、`/transcript` 三个下载路由因此完全不用认识追加讨论。事件上新增
+  `followup_start` / `followup_done`，其余（topic / turn / section / converge /
+  quick）复用 run 的那套。
+- **mock 下不做统一轮**，和 `pipeline` 一致；追加的一节会带模拟警告。
+
 ---
 
 ## 七、换模型
@@ -462,18 +552,19 @@ tiktoken 会去 `openaipublic.blob.core.windows.net` **下载**——那个域�
 uv run pytest
 ```
 
-289 条，全部离线（用的是模拟后端，不花钱、不联网）。八个文件各管一层：
+338 条，全部离线（用的是模拟后端，不花钱、不联网）。九个文件各管一层：
 
 | 文件 | 管什么 |
 |---|---|
-| `tests/test_authoring.py` | JSON 抽取、字段校验、重试、2 人一次调用、3–5 人骨架 + 展开、团队要求、手写槽位、材料提炼 |
+| `tests/test_authoring.py` | JSON 抽取、字段校验、重试、2 人一次调用、3–5 人骨架 + 展开、团队要求、手写槽位、材料提炼、目的 + 材料具体化、按部件重生成 |
 | `tests/test_blueprint.py` | JSON 往返、format 1 自动升级、2–5 人、角色、重名、给人看的那份、`--only` 语义、围栏 |
 | `tests/test_personas.py` | 自定义人格的解析矩阵：mode、人数、数组/旧键、角色名、团队要求、长度、纪律标记 |
 | `tests/test_purpose.py` | 目的的长度边界、从文件读、标题行 |
 | `tests/test_society.py` | 2/3 人轮次与顺序、全员收手、单人反对继续、记录与拼装、最终统一轮、分歧标记 |
 | `tests/test_pipeline_run.py` | 端到端跑一遍：2/3 人落盘、钩子、收手开关、整理环节拿到人数、统一轮的触发/关闭/落盘 |
-| `tests/test_launcher.py` | 广播、HTTP 路由、两段式准入、人数/团队要求、材料拖入与提炼事件、多人事件、统一事件、keep-alive、停止不写文件 |
-| `tests/test_cli.py` | 三个子命令跑得通，`--people` / `--team-hint` / 人格数组，参数给错时报的是人话 |
+| `tests/test_followup.py` | 追加/反复、提问插在标题下、免责声明保持最后、一次性的成果上下文、统一轮、停止/空整理不改文件、追问 → 议题截断 |
+| `tests/test_launcher.py` | 广播、HTTP 路由、两段式准入、人数/团队要求、材料提炼与「材料 + 目的」、重生成议题/人格、多人事件、统一事件、追加讨论事件与反复、keep-alive、停止不写文件 |
+| `tests/test_cli.py` | 五个子命令跑得通，`--people` / `--team-hint` / 人格数组，重生成议题/人格，追加讨论的反复与标题，参数给错时报的是人话 |
 
 几条值得知道的：
 
@@ -489,6 +580,11 @@ uv run pytest
   就是提炼出来的那一份。
 - **`test_distill_material_sends_files_and_material`** 钉住文件名和材料原文
   确实进了提炼提示词——不然「多文件合并」等于没做。
+- **`test_distill_material_with_a_seed_sends_both_purpose_and_material`** 钉住
+  「材料只是参考」：用户目的和材料必须同时进提示词，标题以用户为准。
+- **`test_reforge_topics_keeps_the_purpose_title_and_personas`** /
+  **`test_reforge_personas_also_regenerates_topics`** 钉住重生成只换该换的部分；
+  换人必须连带换题。
 - **`test_the_quick_version_is_compressed_from_the_finished_handbook`**
   钉住速查版的核心不变量：它的输入必须是拼好的完整版，不是对话。
 - **`test_mock_always_runs_the_full_rounds`** 特意用一个**会**说「无异议」的后端：
@@ -536,8 +632,9 @@ daemon worker 线程：同步调用 authoring / pipeline
 - worker 线程里**一个 HTTP 调用都不发**，只往广播里放事件。
 - worker 是 daemon 且**永不 join**：关页面不该等模型把这一轮跑完。
 - **准入必须加锁**。`server._lock` 保护「检查是否有任务在跑 → 构造 job → 赋值」这
-  三步；否则两个 `/forge`（或 `/forge` 撞 `/run`）会同时通过检查，起两个付费 worker。
-  `job.start()` 在锁外调用。锁序单向：`server._lock` → `_Bus._lock`。
+  三步；否则两个 `/forge`（或 `/forge` 撞 `/run` / `/reforge` / `/followup`）会同时
+  通过检查，起两个付费 worker。`job.start()` 在锁外调用。锁序单向：
+  `server._lock` → `_Bus._lock`。
 - **终态事件先于 `finished.set()`**。反过来的话，新 job 的 `bus.reset()` 可能夹在
   中间，旧 job 的 `done` 会落进新 job 的历史里。
 - forge 没有 stop 钩子：`/stop` 只置 `cancelled`，worker 在调用返回后检查
@@ -560,25 +657,31 @@ daemon worker 线程：同步调用 authoring / pipeline
 - **人数**在第一步选（2–5），跟着 `/forge` 请求一起传。逐位编辑器按位置动态增删；
   草稿以 slot 编号存在 `localStorage`，减少人数时只是隐藏，改回去还在，刷新也不丢。
 - **团队要求**只是 forge 的输入，不写进蓝图；生成结果已经把分工固化在 persona 里。
-- **审阅页只读**。想换人或改分工就重新 forge——网页不加载外部蓝图，也没有逐位编辑。
+- **审阅页不加载外部蓝图，也没有逐位编辑**。想换人或改分工，点「重生成人格 + 议题」
+  （用第一步的逐位草稿）或重新 forge；历史蓝图用命令行 `run --blueprint`。
 - `/forge` 的 `personas` 同时接受新数组和旧 `{proposer, challenger}` 对象；
-  数组会包成 `{"personas": [...]}` 再走 `parse_persona_plan`。
+  数组会包成 `{"personas": [...]}` 再走 `parse_persona_plan`。`/reforge` 复用同一个
+  `_plan_from_body`，两条路径对同一份人格输入的解析不会漂移。
 
 事件负载也多人化了：
 
 | 事件 | 字段 |
 |---|---|
-| `forge_start` | `people`、`material`（有没有拖材料）、`files` |
+| `forge_start` | `people`、`material`（有没有拖材料）、`files`、`seeded`（材料是不是只作参考）、`materialMode` |
 | `forge_stage` | `stage`：`distill` / `personas` / `topics` |
-| `material_distilled` | `title`、`purpose`、`files` |
+| `material_distilled` | `title`、`purpose`、`files`、`seeded` |
+| `reforge_start` | `what`（`topics` / `personas`）、`title`、`people`、`topics`、`mock` |
+| `reforge_cancelled` | 取消后的提示文本；旧蓝图保持可用 |
 | `run_start` | `people`、`personas`（数组，含 `name/role/title/stance/position`） |
 | `turn` | `side` 是 `s0`…`s4`（按蓝图顺序，不是固定的 a/b）、`role` |
 | `topic_done` | `conceding`：收手时已经表示无异议的回应者名单 |
 | `converge_start` | `title`、`people`：全部议题结束后开始最终统一轮 |
 | `converge_done` | `allConceded`、`reservations`：统一轮结束后谁还保留意见 |
+| `followup_start` | `index`、`rounds`、`question`、`people`、`mock`、`converge` |
+| `followup_done` | `index`、`title`、`question`、三份产物路径 |
 
-统一轮的逐条发言也走 `turn`，`topic` 是保留 key `convergence`；前端的五套配色
-照旧按 `side` 分配。
+统一轮的逐条发言也走 `turn`，`topic` 是保留 key `convergence`；追加讨论的发言
+走 `turn`，`topic` 是 `followup-N`。前端的五套配色照旧按 `side` 分配。
 
 前端的 5 套配色由 `side` 决定，不再有「方案方 / 挑战者」两色。
 
@@ -586,12 +689,16 @@ daemon worker 线程：同步调用 authoring / pipeline
 
 - 文件只在浏览器里读（`File.text()`），合并成一段文本后随 `/forge` 请求发给
   本地启动器；启动器再把它发给模型做提炼。文件不会先上传到别的地方。
-- 只收 `.md` / `.markdown` / `.txt`；单份 ≤512 KB，一次 ≤20 份，合并后
-  ≤`MAX_MATERIAL` 字。前端先挡，服务端再校验一次。
-- 拖入后**自动锻造并停在审阅**：不会自动点「开始对谈」。想改目的/人数/人格，
-  直接改输入框再点「锻造蓝图」即可，此时不会重复发送材料。
+- 只收 `.md` / `.markdown` / `.txt`；单份 ≤10 MB、一次 ≤50 份、合并后
+  ≤`MAX_MATERIAL` 字。三者都可以用 `DUO_FORGE_MAX_MATERIAL*` 环境变量调整；
+  前端先挡，服务端再校验一次。
+- 拖入后只**暂存**材料，不自动锻造：页面先让用户选材料用途（`distill` / `seed`），
+  必要时先写目的，再点「锻造蓝图」或「用这份材料锻造」。材料留在浏览器内存里，
+  重复锻造会继续带上它；点「不用材料」才清掉。
 - 目的和标题在 `material_distilled` 时回填，`forge_done` 时也会从蓝图 payload
-  回填一次——刷新页面后看到的是提炼后的那一份。
+  回填一次——刷新页面后看到的是提炼 / 具体化后的那一份。
+- `materialMode=seed` 时 `/forge` 会先校验用户目的；目的太短或没写会在准入阶段
+  被挡住，不消耗模型调用，也不清掉上一轮蓝图和历史。
 
 > 顺手修了一个老 bug：`pickTab` 里用 `getElementById("#tab-chat")` 取元素多写了一个
 > `#`，每次 forge/run 开始都会抛 `Cannot set properties of null`。`$` 是
