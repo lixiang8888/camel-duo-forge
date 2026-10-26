@@ -27,6 +27,13 @@ if TYPE_CHECKING:  # 只为类型标注，运行时不导入（避免拖进 came
     from .society import ConvergenceResult, TopicTranscript, Turn
 
 
+#: 对谈轮数的上限/下限。下限 1 是「一问一答一次」，不是 2——society 的
+#: `MIN_ROUNDS=2` 只约束「提前收手」最早能在第几轮发生，不约束结构轮数。
+#: 放在这里是因为 `run` 和「追加讨论」用的是同一套边界。
+MIN_ROUNDS = 1
+MAX_ROUNDS = 6
+
+
 class RunStopped(RuntimeError):
     """用户中途喊停。
 
@@ -54,6 +61,8 @@ class RunResult:
     #: 全部议题结束后，成果里仍有分歧时跑的那一轮「最终统一意见」（附录 D）。
     #: 没跑统一轮、或统一轮没有产出时是空串。
     convergence: str = ""
+    #: 这一轮是不是模拟模式。追加讨论用它判断「原成果和这一轮的模式对不对得上」。
+    mock: bool = False
 
 
 @dataclass
@@ -293,6 +302,7 @@ def run_pipeline(
         quick=quick,
         transcript=transcript_text,
         convergence=convergence_section,
+        mock=mock,
     )
     if h.on_run_done:
         h.on_run_done(result)

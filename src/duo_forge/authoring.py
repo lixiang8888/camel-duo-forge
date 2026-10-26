@@ -21,6 +21,13 @@
 **天然意见不一致**的具体问题。这是整个项目产出有没有信息量的唯一来源：
 大家互相附和，成果就是一锅正确的废话。所以两处提示词里这条都写在最前面。
 
+## 另外两条路径
+
+- `distill_material(..., seed=Purpose)`：拖入的文件不是目的文件时，让用户先写
+  一句目的，材料降级成参考资料，模型只把用户的目的具体化，不另起一个目的。
+- `reforge_blueprint(..., what="topics" | "personas")`：只换议题，或只换人格
+  （议题连带重生成），目的和标题原样保留；新蓝图另存，旧的不覆盖。
+
 ## 一个刻意的不对称
 
 人格里的**发言纪律不归模型写**（见 `personas.py` 开头）：模型只写
@@ -53,6 +60,7 @@ from .purpose import MAX_MATERIAL, MAX_PURPOSE, MAX_TITLE, MIN_PURPOSE, Purpose
 from .topics import (
     CLOSING_KEY,
     DEFAULT_TOPIC_COUNT,
+    FOLLOWUP_KEY_PREFIX,
     MAX_BRIEF,
     MAX_GOAL,
     MAX_OPENING,
@@ -71,8 +79,10 @@ __all__ = [
     "assemble_blueprint",
     "distill_material",
     "forge",
+    "forge_followup_topic",
     "forge_personas",
     "forge_topics",
+    "reforge_blueprint",
 ]
 
 # 长度上限统一放在 personas.py（那里不依赖 camel，CLI / launcher 校验时也能用）。
@@ -175,6 +185,41 @@ DISTILL_PROMPT = """材料来自：{files}
 ---
 
 请提炼出成果标题和目的。只输出那个 JSON 对象。"""
+
+DISTILL_SEED_SYSTEM = """你是「目的具体化师」。用户会给你一段目的，以及一份或多份参考材料。
+
+你的任务**不是另起一个目的**，而是把用户的目的具体化成一段可以拿去做多方对谈的目的。
+
+要求：
+
+1. 用户的目的为主：不要改变用户想做的事、给谁用、想要什么形态的成果。
+   材料只是参考，用来补充细节、约束、场景和数字；材料里与用户目的无关的内容
+   不要带进来。
+2. 目的要写清：这份东西想解决什么问题、给谁用、希望得到什么形态的成果。
+   200–800 字，最多不超过 2000 字。保留用户目的里的具体约束和数字。
+3. 如果用户的目的已经很具体，就只补上材料里能支撑它的关键细节，不要把它写成空话。
+4. 标题 6–14 字，像个书名。用户给了标题就照用；没给就按具体化后的目的起一个。
+5. 全程中文。
+6. 只输出一个 JSON 对象，不要写任何解释，不要用 ``` 包裹：
+
+{
+  "title": "6–14 字的成果标题",
+  "distilled_purpose": "结合材料具体化后的目的"
+}"""
+
+DISTILL_SEED_PROMPT = """用户已经给出目的：
+
+{seed_purpose}
+{title_hint}
+材料来自：{files}
+
+以下是材料全文：
+
+{material}
+
+---
+
+请以用户的目的为主，结合材料把它具体化。只输出那个 JSON 对象。"""
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +356,52 @@ TOPICS_PROMPT = """目的：
 {personas}
 
 请设计 {count} 个议题，按他们对谈的先后顺序排列。只输出那个 JSON 对象。"""
+
+
+# ---------------------------------------------------------------------------
+# 读完成果后的追加讨论
+# ---------------------------------------------------------------------------
+
+FOLLOWUP_SYSTEM = """你是「追加议题设计师」。读者已经读完成果，现在提出了一个追问。
+你要把这次追问变成一场专家对谈的议题，并写出主提出方的开场发言。
+
+要求：
+
+1. 只围绕读者问的那一点，不要借机展开成泛泛的综述，也不要重复成果里已经写清的内容。
+2. `section_title` 是一个不带序号的短标题（6–24 字），要能一眼看出问的是什么。
+3. `goal` 是这一节谈完要收敛出什么，120 字以内。
+4. `opening` 是第 1 位专家（主提出方）的开场发言：结论先行，结合现有成果给出
+   具体回答，并留出让其他专家挑刺的空间。250 字以内，要像人在说话。
+5. 不要设计收尾议题，不要写发言纪律。
+6. 全程中文。
+
+输出：只输出一个 JSON 对象，不要写任何解释，不要用 ``` 包裹。
+
+{
+  "section_title": "6–24 字，不带序号",
+  "goal": "这一节要收敛出什么",
+  "opening": "第 1 位专家（主提出方）的开场发言"
+}"""
+
+FOLLOWUP_PROMPT = """成果标题：《{title}》
+
+原来的目的：
+
+{purpose}
+
+这是第 {index} 次追加讨论。读者的追问：
+
+{question}
+
+现有成果的全文（过长时已截断）：
+
+{excerpt}
+
+请按上面的要求设计这次追加讨论。只输出那个 JSON 对象。"""
+
+FOLLOWUP_TITLE_HINT = """
+本节标题已经由读者定为「{title}」，`section_title` 照用它，不要另起。
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -682,6 +773,46 @@ def _unique_key(raw: Any, index: int, seen: set[str]) -> str:
     return key
 
 
+def _clip(text: str, limit: int) -> str:
+    """把一段文本截到上限以内，截断时留下一个省略号。"""
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(1, limit - 1)].rstrip() + "…"
+
+
+def _parse_followup_topic(
+    raw: dict,
+    *,
+    question: str,
+    index: int,
+    section_title_hint: str = "",
+) -> Topic:
+    """解析一次追加讨论的议题。
+
+    `brief` 不放模型写的东西，而是读者原问题的截断版：追问就是要围绕读者
+    问的那一点谈，让模型再概括一次只会把它写跑偏。完整的原问题由调用方
+    作为一次性上下文发给专家（见 `society.debate_topic(context=...)`）。
+    """
+    prefix = f"追加讨论 {index}："
+    title_limit = max(8, MAX_SECTION_TITLE - len(prefix))
+    hint = section_title_hint.strip()
+    section_title = (
+        _clip(hint, title_limit)
+        if hint
+        else _field(raw, "section_title", "追加讨论的标题", title_limit)
+    )
+    # 标题会拼进 `## 追加讨论 N：…` 这一行；模型偶尔会在里面换行，折叠掉。
+    section_title = " ".join(section_title.split())
+    return Topic(
+        key=f"{FOLLOWUP_KEY_PREFIX}-{index}",
+        section_title=prefix + section_title,
+        brief=_clip(question, MAX_BRIEF),
+        goal=_field(raw, "goal", "追加讨论的目标", MAX_GOAL),
+        opening=_field(raw, "opening", "追加讨论的开场发言", MAX_OPENING),
+    )
+
+
 # ---------------------------------------------------------------------------
 # 调用
 # ---------------------------------------------------------------------------
@@ -736,13 +867,21 @@ def _parse_distilled(raw: dict) -> Purpose:
 
 
 def distill_material(
-    material: str, *, backend, files: Sequence[str] = ()
+    material: str,
+    *,
+    backend,
+    files: Sequence[str] = (),
+    seed: Purpose | None = None,
 ) -> Purpose:
     """把网页拖入的材料提炼成一段目的。
 
     这是多人/单人模式之外**额外的一次模型调用**：材料可能是一份长文档，
     不适合直接塞进每个人的 system message，所以先压成一段 ≤2000 字的目的，
     后面的 forge 仍然只认 Purpose。
+
+    `seed` 是用户自己写的目的。给了它，材料就从「目的的来源」变成「参考资料」：
+    模型不得改变用户想做的事，只把目的具体化。用户给了标题时，标题以用户为准，
+    模型起的标题会被丢弃。没给 seed 时行为与原来完全一致（从材料提炼目的）。
     """
     if not isinstance(material, str):
         raise AuthoringError("材料必须是文本。")
@@ -756,9 +895,28 @@ def distill_material(
         )
 
     names = "、".join(name for name in files if name) or "用户拖入的材料"
-    prompt = DISTILL_PROMPT.format(files=names, material=text)
-    agent = ChatAgent(system_message=DISTILL_SYSTEM, model=backend)
-    return _ask_json(agent, prompt, _parse_distilled, what="目的提炼")
+    if seed is None:
+        prompt = DISTILL_PROMPT.format(files=names, material=text)
+        agent = ChatAgent(system_message=DISTILL_SYSTEM, model=backend)
+        return _ask_json(agent, prompt, _parse_distilled, what="目的提炼")
+
+    if not seed.text.strip():
+        raise AuthoringError("用户给的目的为空，无法结合材料具体化。")
+    title_hint = (
+        f"\n用户已经给出标题《{seed.title}》，照用，不要另起。\n"
+        if seed.title
+        else ""
+    )
+    prompt = DISTILL_SEED_PROMPT.format(
+        seed_purpose=seed.text.strip(),
+        title_hint=title_hint,
+        files=names,
+        material=text,
+    )
+    agent = ChatAgent(system_message=DISTILL_SEED_SYSTEM, model=backend)
+    made = _ask_json(agent, prompt, _parse_distilled, what="目的具体化")
+    # 用户显式给了标题就照用；模型起的标题只在用户没给时才有意义。
+    return Purpose(text=made.text, title=seed.title) if seed.title else made
 
 
 def forge_personas(
@@ -858,6 +1016,51 @@ def forge_topics(
     return _ask_json(agent, prompt, _parse_topics, what="议题")
 
 
+def forge_followup_topic(
+    question: str,
+    *,
+    backend,
+    title: str,
+    purpose: str,
+    excerpt: str = "",
+    index: int = 1,
+    section_title_hint: str = "",
+) -> Topic:
+    """把读者读完成果后的一个追问，变成一场专家对谈的议题。
+
+    这是追加讨论**额外的一次模型调用**（和 `forge_topics` 类似）：模型结合
+    成果全文和问题，写出一节的标题、目标和主提出方的开场发言。问题本身
+    不会被改写——它直接作为这一节的 brief。
+
+    `section_title_hint` 是网页/命令行上用户自己起的标题；给了就用它，
+    模型只需要写 goal 和 opening。
+    """
+    title_hint = (
+        FOLLOWUP_TITLE_HINT.format(title=section_title_hint.strip())
+        if section_title_hint.strip()
+        else ""
+    )
+    prompt = FOLLOWUP_PROMPT.format(
+        title=title,
+        purpose=purpose,
+        index=index,
+        question=question.strip(),
+        excerpt=excerpt.strip() or "（没有读取到现有成果。）",
+    ) + title_hint
+    agent = ChatAgent(system_message=FOLLOWUP_SYSTEM, model=backend)
+    return _ask_json(
+        agent,
+        prompt,
+        lambda raw: _parse_followup_topic(
+            raw,
+            question=question,
+            index=index,
+            section_title_hint=section_title_hint,
+        ),
+        what="追加讨论议题",
+    )
+
+
 def assemble_blueprint(
     purpose: Purpose,
     forged: ForgedPersonas,
@@ -900,3 +1103,63 @@ def forge(
         purpose, forged.personas, backend=backend, count=topic_count
     )
     return assemble_blueprint(purpose, forged, topics)
+
+
+def reforge_blueprint(
+    blueprint: "Blueprint",
+    *,
+    backend,
+    what: str,
+    topic_count: int | None = None,
+    plan: PersonaPlan | None = None,
+    origin: str = "",
+) -> "Blueprint":
+    """只重生成蓝图的一部分，保留其余部分。
+
+    - `what="topics"`：目的、标题、slug、人格都不动，只重新选题。
+    - `what="personas"`：重新生成人格；因为议题是围绕这组人格生成的，
+      所以议题**连带重生成**。目的、标题、slug 不动。
+
+    `topic_count` 默认保持蓝图里现有的议题数，避免「只想换一批议题」时
+    数量也跟着变。`origin` 由调用方按这一轮实际用的后端传（mock / model），
+    否则新蓝图会继承旧来源，页面上的「模拟生成」标记就会说谎。
+    """
+    from .blueprint import Blueprint
+
+    if what not in ("topics", "personas"):
+        raise AuthoringError(
+            f"不支持只重生成「{what}」：只能是 topics 或 personas。"
+        )
+
+    count = len(blueprint.topics) if topic_count is None else topic_count
+    count = max(1, min(MAX_TOPICS, int(count)))
+
+    if what == "topics":
+        topics = forge_topics(
+            blueprint.purpose,
+            blueprint.personas,
+            backend=backend,
+            count=count,
+        )
+        return Blueprint(
+            purpose=blueprint.purpose,
+            title=blueprint.title,
+            slug=blueprint.slug,
+            personas=blueprint.personas,
+            topics=tuple(topics),
+            origin=origin or blueprint.origin,
+        )
+
+    plan = plan or PersonaPlan(people=blueprint.people)
+    forged = forge_personas(blueprint.purpose, backend=backend, plan=plan)
+    topics = forge_topics(
+        blueprint.purpose, forged.personas, backend=backend, count=count
+    )
+    return Blueprint(
+        purpose=blueprint.purpose,
+        title=blueprint.title,
+        slug=blueprint.slug,
+        personas=forged.personas,
+        topics=tuple(topics),
+        origin=origin or blueprint.origin,
+    )

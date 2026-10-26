@@ -669,3 +669,149 @@ def test_distill_parse_rejects_a_multiline_title():
             }
         )
     assert "单行" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# 目的 + 材料：用户给目的，材料只作参考
+# ---------------------------------------------------------------------------
+
+
+def test_distill_material_with_a_seed_uses_the_users_title():
+    seed = Purpose(text="给刚上班、每天坐十小时的程序员写一份能照做的手册。", title="我的颈椎手册")
+
+    result = distill_material(
+        "# 参考资料\n\n一些和颈椎有关的背景。",
+        backend=ScriptedAuthorBackend(),
+        seed=seed,
+    )
+
+    assert result.title == "我的颈椎手册"
+    assert "具体化" in result.text
+
+
+def test_distill_material_with_a_seed_sends_both_purpose_and_material():
+    backend = RecordingAuthorBackend()
+    seed = Purpose(text="UNIQUE_SEED_PURPOSE_9f2a：给程序员写一份能照做的手册。")
+
+    distill_material(
+        "UNIQUE_MATERIAL_MARKER_7c1e",
+        backend=backend,
+        files=["ref.md"],
+        seed=seed,
+    )
+
+    prompt = backend.seen_prompts[0]
+    assert "UNIQUE_SEED_PURPOSE_9f2a" in prompt
+    assert "UNIQUE_MATERIAL_MARKER_7c1e" in prompt
+    assert "ref.md" in prompt
+    assert "目的具体化师" in prompt
+
+
+def test_distill_material_with_a_seed_keeps_the_model_title_when_the_user_did_not_give_one():
+    result = distill_material(
+        "一些参考材料",
+        backend=ScriptedAuthorBackend(),
+        seed=Purpose(text="给刚上班、每天坐十小时的程序员写一份能照做的手册。"),
+    )
+
+    assert result.title == "模拟目的细化手册"
+
+
+def test_distill_material_rejects_an_empty_seed():
+    with pytest.raises(AuthoringError) as excinfo:
+        distill_material(
+            "一些材料",
+            backend=ScriptedAuthorBackend(),
+            seed=Purpose(text="   "),
+        )
+    assert "目的为空" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# 只重生成一部分：议题 / 人格
+# ---------------------------------------------------------------------------
+
+
+def test_reforge_topics_keeps_purpose_title_personas(blueprint, monkeypatch):
+    calls: dict[str, int] = {}
+    real = authoring.forge_topics
+
+    def spy(purpose, personas, *, backend, count):
+        calls["count"] = count
+        return real(purpose, personas, backend=backend, count=count)
+
+    monkeypatch.setattr(authoring, "forge_topics", spy)
+
+    made = authoring.reforge_blueprint(
+        blueprint,
+        backend=ScriptedAuthorBackend(),
+        what="topics",
+        origin="mock",
+    )
+
+    assert calls["count"] == len(blueprint.topics)
+    assert made.purpose == blueprint.purpose
+    assert made.title == blueprint.title
+    assert made.slug == blueprint.slug
+    assert made.personas == blueprint.personas
+    assert made.topics
+    assert made.origin == "mock"
+    # 重新生成的议题不是原来那批
+    assert {t.key for t in made.topics} != {t.key for t in blueprint.topics}
+
+
+def test_reforge_personas_also_regenerates_topics(blueprint, monkeypatch):
+    calls = {"personas": 0, "topics": 0}
+    real_personas = authoring.forge_personas
+    real_topics = authoring.forge_topics
+
+    def spy_personas(purpose, *, backend, plan=None):
+        calls["personas"] += 1
+        return real_personas(purpose, backend=backend, plan=plan)
+
+    def spy_topics(purpose, personas, *, backend, count):
+        calls["topics"] += 1
+        return real_topics(purpose, personas, backend=backend, count=count)
+
+    monkeypatch.setattr(authoring, "forge_personas", spy_personas)
+    monkeypatch.setattr(authoring, "forge_topics", spy_topics)
+
+    made = authoring.reforge_blueprint(
+        blueprint,
+        backend=ScriptedAuthorBackend(),
+        what="personas",
+    )
+
+    assert calls == {"personas": 1, "topics": 1}
+    assert made.purpose == blueprint.purpose
+    assert made.title == blueprint.title
+    assert made.slug == blueprint.slug
+    assert made.topics
+
+
+def test_reforge_personas_can_use_a_manual_plan(blueprint):
+    plan = parse_persona_plan(
+        {
+            "personas": [
+                _MANUAL_PROPOSER,
+                {"mode": "hint", "hint": "一位带过很多程序员的实战派教练"},
+            ]
+        }
+    )
+    made = authoring.reforge_blueprint(
+        blueprint,
+        backend=ScriptedAuthorBackend(),
+        what="personas",
+        plan=plan,
+    )
+
+    assert made.personas[0].name == "许医师"
+    assert made.personas[1].name == "挑刺方"
+
+
+def test_reforge_rejects_an_unknown_target(blueprint):
+    with pytest.raises(AuthoringError) as excinfo:
+        authoring.reforge_blueprint(
+            blueprint, backend=ScriptedAuthorBackend(), what="purpose"
+        )
+    assert "topics 或 personas" in str(excinfo.value)

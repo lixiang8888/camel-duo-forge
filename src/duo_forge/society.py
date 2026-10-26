@@ -195,11 +195,17 @@ def debate_topic(
     early_stop: bool = False,
     min_rounds: int = MIN_ROUNDS,
     tools: Optional[Sequence] = None,
+    context: Optional[str] = None,
 ) -> TopicTranscript:
     """让 2–5 位参与者围绕一个议题对谈若干轮，返回完整记录。
 
     `personas` 的顺序即语义：`[0]` 是主提出方（先开场、每轮最后回应），
     `[1:]` 是回应者（按顺序先发言）。
+
+    `context` 是**一次性**的背景材料，比如读者读完成果后的追问所针对的成果摘要。
+    它作为一条「用户消息」进入每位参与者的记忆，发生在开场白之前；它不写进
+    对话记录，也不占用 `Topic` 的字段。默认 None，原有流程一字不变。
+    注意它会一直留在记忆里，随之后每一轮一起重发，所以调用方必须自己控制长度。
 
     `should_stop` 只在**轮次边界**被问到：一轮里每一位都要调用一次模型，
     没法从中间掐断，所以点了停止最坏要等当前这一轮跑完才收手。
@@ -236,6 +242,15 @@ def debate_topic(
     ]
 
     transcript = TopicTranscript(topic=topic, planned_rounds=rounds)
+
+    # 一次性背景：读者追问时，先把现有成果的摘要发给所有人，再让主提出方开场。
+    # 它不记进 transcript——那是「谁说了什么」，这不是任何一位专家说的。
+    if context and context.strip():
+        background = BaseMessage.make_user_message(
+            role_name="系统", content=context.strip()
+        )
+        for agent in agents:
+            agent.update_memory(background, OpenAIBackendRole.USER)
 
     def record(speaker: str, role: str, content: str) -> None:
         if not content:

@@ -1,10 +1,12 @@
 """命令行入口。
 
-三个子命令，对应流程的两段：
+五个子命令，对应流程的两段，外加「按部件重生成」和「读完成果再追问」：
 
-    forge   目的 → 2–5 位专家的人格 + 一组议题 → 蓝图（落盘，可读可改）
-    run     蓝图 → 对谈 → 整理 → 成果文件
-    show    把一份蓝图摊开给人看（不调用模型）
+    forge     目的 → 2–5 位专家的人格 + 一组议题 → 蓝图（落盘，可读可改）
+    reforge   只重生成现有蓝图的议题，或人格（连带议题）
+    run       蓝图 → 对谈 → 整理 → 成果文件
+    followup  成果手册 + 一个追问 → 同一批专家再谈一轮 → 追加进手册
+    show      把一份蓝图摊开给人看（不调用模型）
 
 `run` 也接受 `--purpose`：那就先 forge 一遍再跑。但**跑第二次时建议用
 `--blueprint`** ——forge 每次的结果都不一样，同一份目的连着跑两次会得到
@@ -35,7 +37,7 @@ from .personas import (
     parse_team_hint,
 )
 from .purpose import InvalidPurpose, Purpose, make_purpose, read_purpose_file
-from .topics import DEFAULT_TOPIC_COUNT
+from .topics import DEFAULT_TOPIC_COUNT, MAX_TOPICS
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +205,75 @@ def _save_and_report(made: Blueprint, out_dir: Path) -> int:
 
 
 # ---------------------------------------------------------------------------
+# reforge
+# ---------------------------------------------------------------------------
+
+
+def _cmd_reforge(args: argparse.Namespace) -> int:
+    """只重生成蓝图的一部分：议题，或人格（连带议题）。"""
+    from . import authoring  # 惰性 import：会拖进 camel
+
+    try:
+        bp = blueprint_mod.load(args.blueprint)
+    except BlueprintError as exc:
+        return _fail("蓝图有问题", exc)
+
+    if args.what not in ("topics", "personas"):
+        return _fail("参数有问题", "只能重生成 topics 或 personas。")
+    if args.what == "topics" and (
+        args.people is not None
+        or args.personas_file is not None
+        or args.team_hint.strip()
+    ):
+        return _fail(
+            "参数冲突",
+            "重生成议题时人格不变，不能再给 --people / --personas-file / --team-hint。"
+            "想换人请用 --what personas。",
+        )
+
+    plan = None
+    if args.what == "personas":
+        try:
+            plan = _load_persona_plan(
+                args.personas_file,
+                people=args.people or bp.people,
+                team_hint=args.team_hint,
+            )
+        except PersonaSpecError as exc:
+            return _fail("人格设定有问题", exc)
+
+    count = args.topics if args.topics is not None else len(bp.topics)
+    count = max(1, min(MAX_TOPICS, count))
+    target = "议题" if args.what == "topics" else "人格 + 议题"
+    if args.what == "topics" or (plan is not None and plan.all_manual):
+        calls = 1
+    else:
+        calls = 2 if (plan.people if plan else bp.people) == 2 else 3
+    print(f"用蓝图：{args.blueprint}")
+    print(f"保留：目的《{bp.title}》和标题；重新生成：{target}")
+    print(f"这条路径最多 {calls} 次模型调用")
+    if args.mock:
+        print("!! 模拟模式：重新生成的内容是占位内容，没有参考价值。")
+    print()
+
+    try:
+        made = authoring.reforge_blueprint(
+            bp,
+            backend=build_author_backend(mock=args.mock),
+            what=args.what,
+            topic_count=count,
+            plan=plan,
+            origin="mock" if args.mock else "model",
+        )
+    except MissingApiKey as exc:
+        return _fail("配置缺失", exc)
+    except authoring.AuthoringError as exc:
+        return _fail("生成失败", exc)
+
+    return _save_and_report(made, args.out)
+
+
+# ---------------------------------------------------------------------------
 # run
 # ---------------------------------------------------------------------------
 
@@ -363,6 +434,137 @@ def _cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# followup
+# ---------------------------------------------------------------------------
+
+
+def _cmd_followup(args: argparse.Namespace) -> int:
+    """读完成果后继续追问：把新的一节追加进同一份手册。"""
+    from . import authoring, followup, pipeline
+
+    try:
+        bp = blueprint_mod.load(args.blueprint)
+    except BlueprintError as exc:
+        return _fail("蓝图有问题", exc)
+
+    handbook_path = Path(args.handbook)
+    try:
+        handbook = handbook_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return _fail("读不出成果手册", f"{handbook_path}：{exc}")
+
+    try:
+        question = followup.check_question(args.question)
+        title = followup.check_title(args.title)
+    except followup.FollowupError as exc:
+        return _fail("追问有问题", exc)
+
+    rounds = max(pipeline.MIN_ROUNDS, min(pipeline.MAX_ROUNDS, args.rounds))
+
+    # 实录和速查默认按「同批产物同名前缀」推出来，省得每次手敲路径。
+    if args.transcript is not None:
+        transcript_path = Path(args.transcript)
+        try:
+            transcript = transcript_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            return _fail("读不出对话实录", f"{transcript_path}：{exc}")
+    else:
+        transcript_path = followup.sibling_path(handbook_path, "transcript")
+        transcript = ""
+        if transcript_path.exists():
+            try:
+                transcript = transcript_path.read_text(encoding="utf-8")
+            except OSError as exc:
+                return _fail("读不出对话实录", f"{transcript_path}：{exc}")
+        if not transcript:
+            print(f"· 没有找到对话实录 {transcript_path}，本次追加会新建一份。")
+    quick_path = (
+        Path(args.quick)
+        if args.quick is not None
+        else followup.sibling_path(handbook_path, "quick")
+    )
+
+    print(f"用蓝图：{args.blueprint}")
+    print(f"成果手册：{handbook_path}")
+    print(f"追问：{question}")
+
+    try:
+        backend = build_backend(mock=args.mock)
+        author_backend = build_author_backend(mock=args.mock)
+    except MissingApiKey as exc:
+        return _fail("配置缺失", exc)
+
+    if args.mock:
+        print("\n!! 模拟模式：追加的一节是占位内容，没有参考价值。\n")
+    else:
+        calls = 1 + rounds * bp.people + 1 + (bp.people if args.converge else 0) + 1
+        print(
+            f"真实模式：本次最多约 {calls} 次模型调用"
+            "（追问设计 + 对谈 + 整理 + 可选统一 + 速查）。\n"
+        )
+
+    def followup_start(index: int, total_rounds: int, question: str) -> None:
+        print(f"第 {index} 次追加讨论，每个议题最多 {total_rounds} 轮：")
+
+    def unify_start() -> None:
+        print("\n本节仍标着分歧，追加一轮强制统一……")
+
+    def unify_done(result) -> None:
+        if result.all_conceded:
+            print("    统一轮完成：所有回应者都接受统一结论")
+        else:
+            who = "、".join(name for name, _ in result.reservations)
+            print(f"    统一轮结束：{who} 仍保留意见")
+
+    def done(result) -> None:
+        print(f"\n已追加第 {result.index} 节：{result.topic.section_title}")
+        print(f"成果文件：{result.handbook_path}")
+        if result.quick_path:
+            print(f"一页速查：{result.quick_path}")
+        print(f"对话实录：{result.transcript_path}")
+
+    hooks = followup.FollowupHooks(
+        on_followup_start=followup_start,
+        on_topic_start=lambda topic: print(topic.section_title),
+        on_turn=lambda turn: print(f"    · {turn.speaker} 发言 {len(turn.content)} 字"),
+        on_topic_done=lambda transcript: print(_topic_done_line(transcript)),
+        on_section_done=lambda markdown: print("    已整理成一节"),
+        on_unify_start=unify_start,
+        on_unify_done=unify_done,
+        on_quick_start=lambda: print("    正在按更新后的全文重压一页速查……"),
+        on_followup_done=done,
+    )
+
+    try:
+        followup.run_followup(
+            blueprint=bp,
+            handbook=handbook,
+            handbook_path=handbook_path,
+            question=question,
+            title=title,
+            rounds=rounds,
+            mock=args.mock,
+            converge=args.converge,
+            backend=backend,
+            author_backend=author_backend,
+            transcript=transcript,
+            transcript_path=transcript_path,
+            quick_path=quick_path,
+            hooks=hooks,
+        )
+    except pipeline.RunStopped:
+        print("\n已停止：本次追加作废，成果文件没有被改动。", file=sys.stderr)
+        return 1
+    except MissingApiKey as exc:
+        return _fail("配置缺失", exc)
+    except authoring.AuthoringError as exc:
+        return _fail("生成失败", exc)
+    except followup.FollowupError as exc:
+        return _fail("追加失败", exc)
+    return 0
+
+
 def _hooks(run_start, run_done):
     from . import pipeline
 
@@ -431,6 +633,28 @@ def main(argv: list[str] | None = None) -> int:
     forge.add_argument("--mock", action="store_true", help="离线模拟，不调用真实模型")
     forge.set_defaults(func=_cmd_forge)
 
+    reforge = sub.add_parser(
+        "reforge", help="只重生成现有蓝图的议题，或人格（连带议题）"
+    )
+    reforge.add_argument(
+        "--blueprint", type=Path, required=True, help="要改的蓝图 JSON 文件"
+    )
+    reforge.add_argument(
+        "--what", choices=("topics", "personas"), required=True,
+        help="重生成议题（保留人格），或重生成人格（连带重生成议题）",
+    )
+    _add_persona_args(reforge)
+    reforge.add_argument(
+        "--topics", type=int, default=None,
+        help="重新生成几个议题（默认保持蓝图里现有的数量）",
+    )
+    reforge.add_argument(
+        "--out", type=Path, default=BLUEPRINT_DIR,
+        help="新蓝图的输出目录（默认 blueprints/）",
+    )
+    reforge.add_argument("--mock", action="store_true", help="离线模拟，不调用真实模型")
+    reforge.set_defaults(func=_cmd_reforge)
+
     run = sub.add_parser("run", help="用蓝图（或现生成一份）跑完整流程")
     run.add_argument(
         "--blueprint", type=Path, default=None,
@@ -458,6 +682,43 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--out", type=Path, default=None, help="产物输出目录（默认 outputs/）")
     run.add_argument("--mock", action="store_true", help="离线模拟，不调用真实模型")
     run.set_defaults(func=_cmd_run)
+
+    followup_parser = sub.add_parser(
+        "followup", help="读完成果后继续追问，把新的一节追加进成果手册"
+    )
+    followup_parser.add_argument(
+        "--blueprint", type=Path, required=True,
+        help="这份成果是用哪份蓝图跑出来的（人格和议题都在里面）",
+    )
+    followup_parser.add_argument(
+        "--handbook", type=Path, required=True, help="要追加的成果手册 .md",
+    )
+    followup_parser.add_argument(
+        "--question", required=True,
+        help="你想对成果追问的那一点，最多 2000 字",
+    )
+    followup_parser.add_argument(
+        "--title", default="", help="这一节的标题（留空由模型起）"
+    )
+    followup_parser.add_argument(
+        "--rounds", type=int, default=3, help="这次追加的轮数上限（默认 3）"
+    )
+    followup_parser.add_argument(
+        "--no-converge", dest="converge", action="store_false",
+        help="这一节整理完仍标着分歧时，也不补统一轮",
+    )
+    followup_parser.add_argument(
+        "--transcript", type=Path, default=None,
+        help="对话实录 .md；默认按手册的同批命名推出来",
+    )
+    followup_parser.add_argument(
+        "--quick", type=Path, default=None,
+        help="一页速查 .md；默认按手册的同批命名推出来",
+    )
+    followup_parser.add_argument(
+        "--mock", action="store_true", help="离线模拟，不调用真实模型"
+    )
+    followup_parser.set_defaults(func=_cmd_followup)
 
     show = sub.add_parser("show", help="把一份蓝图摊开看（不调用模型）")
     show.add_argument("--blueprint", type=Path, required=True, help="蓝图 JSON 文件")

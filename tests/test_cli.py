@@ -468,3 +468,198 @@ def test_run_with_blueprint_and_team_hint_is_refused(tmp_path, capsys):
     )
     assert code == 2
     assert "--team-hint" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# followup：读完成果后继续追问
+# ---------------------------------------------------------------------------
+
+
+def _run_for_handbook(tmp_path):
+    """跑一轮最小的 mock run，返回 (蓝图路径, 成果目录)。"""
+    _forge(tmp_path)
+    bp_path = next(tmp_path.glob("*.json"))
+    out = tmp_path / "out"
+    assert (
+        main(
+            [
+                "run", "--blueprint", str(bp_path), "--mock", "--rounds", "1",
+                "--out", str(out),
+            ]
+        )
+        == 0
+    )
+    return bp_path, out
+
+
+def test_followup_appends_a_section_and_can_repeat(tmp_path, capsys):
+    bp_path, out = _run_for_handbook(tmp_path)
+    capsys.readouterr()
+
+    handbook = next(out.glob("handbook-*.md"))
+    transcript = next(out.glob("transcript-*.md"))
+    quick = next(out.glob("quick-*.md"))
+
+    assert (
+        main(
+            [
+                "followup", "--blueprint", str(bp_path), "--handbook", str(handbook),
+                "--question", "连续开会时做不到怎么办？", "--rounds", "1", "--mock",
+            ]
+        )
+        == 0
+    )
+
+    text = handbook.read_text(encoding="utf-8")
+    assert "## 追加讨论 1：" in text
+    assert "连续开会时做不到怎么办？" in text
+    assert "追加讨论 1" in transcript.read_text(encoding="utf-8")
+    assert "模拟模式生成的占位速查" in quick.read_text(encoding="utf-8")
+    out_text = capsys.readouterr().out
+    assert "已追加第 1 节" in out_text
+    assert "成果文件：" in out_text
+
+    # 再来一次：编号递增；自己给的标题照用
+    assert (
+        main(
+            [
+                "followup", "--blueprint", str(bp_path), "--handbook", str(handbook),
+                "--question", "那只能坐着做两分钟呢？", "--title", "开会时怎么做",
+                "--rounds", "1", "--mock",
+            ]
+        )
+        == 0
+    )
+    text = handbook.read_text(encoding="utf-8")
+    assert "## 追加讨论 1：" in text
+    assert "## 追加讨论 2：开会时怎么做" in text
+
+
+def test_followup_refuses_a_missing_handbook(tmp_path, capsys):
+    _forge(tmp_path)
+    bp_path = next(tmp_path.glob("*.json"))
+
+    code = main(
+        [
+            "followup", "--blueprint", str(bp_path),
+            "--handbook", str(tmp_path / "nope.md"),
+            "--question", "为什么？", "--mock",
+        ]
+    )
+    assert code == 2
+    assert "读不出成果手册" in capsys.readouterr().err
+
+
+def test_followup_refuses_a_blank_question(tmp_path, capsys):
+    bp_path, out = _run_for_handbook(tmp_path)
+    handbook = next(out.glob("handbook-*.md"))
+
+    code = main(
+        [
+            "followup", "--blueprint", str(bp_path), "--handbook", str(handbook),
+            "--question", "  ", "--mock",
+        ]
+    )
+    assert code == 2
+    assert "追问" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# reforge：只重生成议题或人格
+# ---------------------------------------------------------------------------
+
+
+def test_reforge_topics_keeps_the_purpose_title_and_personas(tmp_path, capsys):
+    _forge(tmp_path)
+    capsys.readouterr()
+    bp_path = next(tmp_path.glob("*.json"))
+    before = blueprint_mod.load(bp_path)
+    out = tmp_path / "reforged"
+
+    assert (
+        main(
+            [
+                "reforge", "--blueprint", str(bp_path), "--what", "topics",
+                "--mock", "--out", str(out),
+            ]
+        )
+        == 0
+    )
+
+    made = blueprint_mod.load(next(out.glob("*.json")))
+    assert made.title == before.title
+    assert made.purpose == before.purpose
+    assert [p.name for p in made.personas] == [p.name for p in before.personas]
+    assert made.topics
+    assert made.origin == "mock"
+
+    printed = capsys.readouterr().out
+    assert "重新生成：议题" in printed
+    assert "duo-forge run --blueprint" in printed
+
+
+def test_reforge_personas_keeps_the_title_and_can_change_people(tmp_path):
+    _forge(tmp_path)
+    bp_path = next(tmp_path.glob("*.json"))
+    before = blueprint_mod.load(bp_path)
+    out = tmp_path / "reforged"
+
+    assert (
+        main(
+            [
+                "reforge", "--blueprint", str(bp_path), "--what", "personas",
+                "--people", "3", "--mock", "--out", str(out),
+            ]
+        )
+        == 0
+    )
+
+    made = blueprint_mod.load(next(out.glob("*.json")))
+    assert made.people == 3
+    assert made.title == before.title
+    assert made.topics
+
+
+def test_reforge_personas_uses_a_personas_file(tmp_path):
+    _forge(tmp_path)
+    bp_path = next(tmp_path.glob("*.json"))
+    path = _write_personas(tmp_path, {"personas": [_MANUAL_PERSONAS["proposer"]]})
+    out = tmp_path / "reforged"
+
+    assert (
+        main(
+            [
+                "reforge", "--blueprint", str(bp_path), "--what", "personas",
+                "--personas-file", str(path), "--mock", "--out", str(out),
+            ]
+        )
+        == 0
+    )
+
+    made = blueprint_mod.load(next(out.glob("*.json")))
+    assert made.personas[0].name == "许医师"
+
+
+def test_reforge_topics_refuses_persona_args(tmp_path, capsys):
+    _forge(tmp_path)
+    bp_path = next(tmp_path.glob("*.json"))
+
+    code = main(
+        [
+            "reforge", "--blueprint", str(bp_path), "--what", "topics",
+            "--people", "3", "--mock",
+        ]
+    )
+    assert code == 2
+    assert "--people" in capsys.readouterr().err
+
+
+def test_reforge_with_a_missing_blueprint_is_refused(tmp_path, capsys):
+    code = main(
+        [
+            "reforge", "--blueprint", str(tmp_path / "nope.json"),
+            "--what", "topics", "--mock",
+        ]
+    )
+    assert code == 2
+    assert "读不出蓝图" in capsys.readouterr().err

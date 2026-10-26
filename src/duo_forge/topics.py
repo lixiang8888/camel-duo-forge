@@ -28,6 +28,15 @@ CLOSING_KEY = "closing"
 #: 好让统一轮复用 Topic / 回调 / 对话记录的接口。
 CONVERGENCE_KEY = "convergence"
 
+#: 读者读完成果后追加提问的长度上下限。它比 `MAX_BRIEF` 宽松，是因为完整的
+#: 问题会作为一次性上下文发给所有专家；system message 里只放截断后的 brief。
+MIN_FOLLOWUP_QUESTION = 2
+MAX_FOLLOWUP_QUESTION = 2000
+
+#: 追加讨论的 key 前缀。每次追加生成 `followup-1` / `followup-2`，只用于页面分组，
+#: 不参与任何业务判断。
+FOLLOWUP_KEY_PREFIX = "followup"
+
 MAX_TOPICS = 12
 
 #: 默认生成几个正文议题（不含自动追加的收尾议题）。

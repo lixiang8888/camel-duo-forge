@@ -183,6 +183,14 @@ _MOCK_DISTILLED = {
     ),
 }
 
+_MOCK_DISTILLED_SEED = {
+    "title": "模拟目的细化手册",
+    "distilled_purpose": (
+        "这是离线模拟模式下结合「用户写的目的」和「参考材料」具体化出的目的，"
+        "不含任何真实内容，只用来验证「目的 + 材料 → 具体目的 → 蓝图」这条链路。"
+    ),
+}
+
 
 def _mock_skeleton(people: int) -> list[dict]:
     return [
@@ -228,6 +236,16 @@ def _requested_people(text: str) -> int:
     if not match:
         return 2
     return max(2, min(5, int(match.group(1))))
+
+
+_MOCK_FOLLOWUP_TOPIC = {
+    "section_title": "模拟追加讨论：把追问接进现有成果",
+    "goal": "给出一个读者可以直接照着做的补充回答，并标明和原成果的关系。",
+    "opening": (
+        "【回应追问】模拟模式下我先给一个占位回答。\n\n"
+        "这里本应结合现有成果回答读者的追问，模拟模式下不产生任何真实结论。"
+    ),
+}
 
 
 _MOCK_TOPICS = {
@@ -276,9 +294,16 @@ class ScriptedAuthorBackend(ScriptedBackend):
             str(m.get("content", "")) for m in messages if isinstance(m, dict)
         )
         people = _requested_people(text)
-        if '"distilled_purpose"' in text:
+        if "目的具体化师" in text:
+            # 网页同时给了用户目的和材料：把用户目的具体化，不是从材料重起。
+            payload: dict = _MOCK_DISTILLED_SEED
+        elif '"distilled_purpose"' in text:
             # 网页拖入材料后的「提炼目的」请求。
-            payload: dict = _MOCK_DISTILLED
+            payload = _MOCK_DISTILLED
+        elif "追加议题设计师" in text:
+            # 读完成果后的「追加讨论」请求。用系统提示词里的身份认，避免和
+            # 议题生成共用 `section_title` 键名时认错。
+            payload = _MOCK_FOLLOWUP_TOPIC
         elif '"proposer"' in text:
             # 两人模式：保持原来的 proposer / challenger schema。
             payload = _MOCK_PERSONAS

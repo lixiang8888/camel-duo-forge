@@ -205,7 +205,15 @@ def convergence_excerpt(handbook: str) -> str:
             continue
         if line.startswith("#"):
             relevant = line.startswith(
-                ("### 要点", "### 两人分歧", "### 各方分歧")
+                (
+                    "### 要点",
+                    "### 两人分歧",
+                    "### 各方分歧",
+                    # 追加讨论里的统一结论也要带上：下一次追问时，
+                    # 专家得先知道上一节最后统一成了什么。
+                    "### 最终统一意见",
+                    "### 保留意见",
+                )
             )
             # 正文小节只有在抽到有用的小节时才带上标题，免得留下一串空标题。
             if relevant and not title_emitted and section_title:
@@ -242,6 +250,35 @@ def assemble_convergence(
         "> 附录 A 记录的是统一前的分歧；统一后的状态以本节为准。",
         "",
         "### 统一结论",
+        "",
+        conclusion,
+        "",
+        "### 保留意见",
+        "",
+    ]
+    if reservations:
+        for name, text in reservations:
+            body = (text.strip() or "（没有明确表态）").replace("\n", "\n  ")
+            lines.append(f"- **{name}**：{body}")
+    else:
+        lines.append("- 无。所有回应者都明确表示接受统一结论。")
+    return "\n".join(lines).strip() + "\n"
+
+
+def assemble_followup_convergence(
+    unified: str, reservations: Sequence[tuple[str, str]]
+) -> str:
+    """追加讨论里的统一轮。
+
+    和 `assemble_convergence` 的区别只有标题层级：追加讨论是成果手册里的一节
+    （`## 追加讨论 N：…`），所以统一结论用 `###` 挂在它下面，而不是另起一个
+    附录。语义完全一样——统一结论和保留意见并存，不抹平真实反对。
+    """
+    conclusion = unified.strip() or (
+        "（本次追加讨论没有给出明确的统一结论，以下保留意见即为最终状态。）"
+    )
+    lines = [
+        "### 最终统一意见",
         "",
         conclusion,
         "",
@@ -314,8 +351,8 @@ def quick_header(title: str, full_name: str, *, unified: bool = False) -> str:
     return f"""# {title} · 速查版
 
 > 这是从完整版 `{full_name}` 压缩出来的一页速查：只留最常用的部分，没有新增任何说法。
-> 分节展开的做法、各方始终没谈拢的地方（附录 A）{extra}、行动自检清单（附录 C）
-> 都在完整版里，需要时再翻。"""
+> 分节展开的做法、各方始终没谈拢的地方（附录 A）{extra}、行动自检清单（附录 C），
+> 以及读完成果后的追加讨论，都在完整版里，需要时再翻。"""
 
 
 def footer() -> str:
