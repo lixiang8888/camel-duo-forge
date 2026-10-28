@@ -67,7 +67,7 @@ from typing import Optional
 
 from duo_forge import followup as followup_mod
 from duo_forge import pipeline
-from duo_forge.blueprint import Blueprint, BlueprintError
+from duo_forge.blueprint import Blueprint, BlueprintError, from_dict as blueprint_from_dict
 from duo_forge.config import (
     BLUEPRINT_DIR,
     OUTPUT_DIR,
@@ -838,6 +838,8 @@ class _ReforgeJob(_Job):
 def _blueprint_payload(bp: Blueprint, path: Optional[Path] = None) -> dict:
     return {
         "ready": True,
+        #: 原始 JSON，网页的「手动编辑蓝图」直接拿它当编辑起点。
+        "raw": bp.to_dict(),
         "origin": bp.origin,
         "title": bp.title,
         "slug": bp.slug,
@@ -1051,6 +1053,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._forge(body)
         elif path == "/reforge":
             self._reforge(body)
+        elif path == "/blueprint/edit":
+            self._blueprint_edit(body)
         elif path == "/run":
             self._run(body)
         elif path == "/followup":
@@ -1252,6 +1256,39 @@ class _Handler(BaseHTTPRequestHandler):
                 "hint": hint,
                 "mock": mock,
             }
+        )
+
+    def _blueprint_edit(self, body: dict) -> None:
+        """把网页上手动编辑的蓝图 JSON 校验、落盘并替换当前蓝图。
+
+        不调用模型，所以不是 `_Job`；但准入规则一样：有任务在跑时不许改，
+        校验和赋值都在 `server._lock` 里完成。
+        """
+        server = self.server
+        raw = body.get("blueprint")
+        if not isinstance(raw, dict):
+            self._json({"ok": False, "why": "blueprint 必须是一个 JSON 对象。"})
+            return
+
+        with server._lock:
+            if server.busy():
+                self._json({"ok": False, "why": "已经有一轮在跑了，等它结束。"})
+                return
+            try:
+                bp = blueprint_from_dict(raw, source="手动编辑的蓝图")
+            except BlueprintError as exc:
+                self._json({"ok": False, "why": str(exc)})
+                return
+            try:
+                json_path, _ = bp.save_bundle(server.blueprint_dir)
+            except OSError as exc:
+                self._json({"ok": False, "why": f"保存蓝图失败：{exc}"})
+                return
+            server.blueprint = bp
+            server.blueprint_path = json_path
+
+        self._json(
+            {"ok": True, "blueprint": _blueprint_payload(bp, json_path)}
         )
 
     def _run(self, body: dict) -> None:
@@ -1592,6 +1629,10 @@ _PAGE = r"""<!DOCTYPE html>
   #followupQuestion { width: 100%; min-height: 70px; resize: vertical; }
   #followupTitle { width: 280px; }
   #reforgeRequirement { width: 100%; min-height: 52px; resize: vertical; margin-top: 6px; }
+  #bpEditJson { width: 100%; min-height: 280px; resize: vertical; margin-top: 8px;
+                font: 12.5px/1.5 ui-monospace, "Cascadia Code", Menlo, Consolas, monospace;
+                white-space: pre; }
+  #bpEditHint.bad { color: var(--bad); }
   .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .row .spacer { flex: 1; }
   .row + .row { margin-top: 9px; }
@@ -1803,6 +1844,20 @@ _PAGE = r"""<!DOCTYPE html>
       <span class="spacer"></span>
     </div>
     <div class="hint" id="reforgeHint"></div>
+    <details id="bpEditBox" class="custom">
+      <summary>手动编辑蓝图（高级）：直接改议题 / 人格 JSON</summary>
+      <textarea id="bpEditJson" spellcheck="false"></textarea>
+      <div class="row" style="margin-top:6px">
+        <span class="hint" id="bpEditHint"></span>
+        <span class="spacer"></span>
+        <button type="button" id="bpEditReset">还原</button>
+        <button type="button" class="primary" id="bpEditApply">应用修改</button>
+      </div>
+      <div class="hint">
+        格式和 <code>blueprints/*.json</code> 一样。保存会另存一份新蓝图；
+        2–5 位专家、议题 key 唯一、必填字段等由服务端校验。
+      </div>
+    </details>
     <div class="row" style="margin-top:10px;border-top:1px dashed var(--border);padding-top:10px">
       <span style="font-size:13px">每个议题最多</span>
       <select id="rounds"></select>
@@ -2370,6 +2425,7 @@ const LOCKED_WHILE_RUNNING = [
   "pickFiles", "fileInput", "materialMode", "materialForgeBtn", "materialClearBtn",
   "runBtn", "rounds", "converge", "runMock",
   "reforgeRequirement", "reforgeTopicsBtn", "reforgePersonasBtn",
+  "bpEditJson", "bpEditReset", "bpEditApply",
   "followupBtn", "followupQuestion", "followupTitle",
 ];
 function setRunning(on) {
@@ -2514,6 +2570,13 @@ function renderBlueprint(payload) {
   updateRunHint();
   updateFollowupHint();
   updateReforgeHint();
+  setBlueprintEditor(payload);
+}
+
+function setBlueprintEditor(payload) {
+  $("bpEditJson").value = JSON.stringify(payload.raw || {}, null, 2);
+  $("bpEditHint").textContent = "";
+  $("bpEditHint").className = "hint";
 }
 
 function selectedKeys() {
@@ -3047,6 +3110,37 @@ async function startReforge(what) {
 }
 $("reforgeTopicsBtn").onclick = () => startReforge("topics");
 $("reforgePersonasBtn").onclick = () => startReforge("personas");
+
+$("bpEditReset").onclick = () => {
+  if (bp) { setBlueprintEditor(bp); }
+};
+$("bpEditApply").onclick = async () => {
+  if (!bp) { return; }
+  let parsed;
+  try {
+    parsed = JSON.parse($("bpEditJson").value);
+  } catch (e) {
+    $("bpEditHint").textContent = "JSON 解析失败：" + e.message;
+    $("bpEditHint").className = "hint bad";
+    return;
+  }
+  setRunning(true);
+  $("bpEditHint").textContent = "正在保存…";
+  $("bpEditHint").className = "hint";
+  const res = await post("/blueprint/edit", { blueprint: parsed });
+  if (!res.ok) {
+    setRunning(false);
+    $("bpEditHint").textContent = res.why || "应用失败";
+    $("bpEditHint").className = "hint bad";
+    return;
+  }
+  renderBlueprint(res.blueprint);
+  setRunning(false);
+  $("bpEditBox").open = true;
+  $("bpEditHint").textContent = "已保存新蓝图：" + (res.blueprint.path || "");
+  $("bpEditHint").className = "hint";
+  notice("蓝图已更新，下一轮 run 会用新版本。", "");
+};
 
 $("runBtn").onclick = async () => {
   const keys = selectedKeys();

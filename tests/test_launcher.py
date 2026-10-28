@@ -496,6 +496,10 @@ def test_early_returns_do_not_corrupt_the_keep_alive_connection(live_server):
         assert request("POST", "/reforge", {"what": "nope"})[0] == 200
         assert request("GET", "/health")[0] == 200
 
+        # 手动编辑蓝图：请求体不是蓝图对象，提前返回
+        assert request("POST", "/blueprint/edit", {})[0] == 200
+        assert request("GET", "/health")[0] == 200
+
         # 没有任务在跑：停止也提前返回
         assert request("POST", "/stop", {})[0] == 200
         assert request("GET", "/health")[0] == 200
@@ -1263,3 +1267,48 @@ def test_page_boot_has_reforge_hint_limit(live_server):
     html = _get(port, "/")
     boot = json.loads(re.search(r"const BOOT = (.*?);\n", html).group(1))
     assert boot["maxReforgeHint"] == launcher.MAX_REFORGE_HINT
+
+
+# ---------------------------------------------------------------------------
+# 手动编辑蓝图
+# ---------------------------------------------------------------------------
+
+
+def test_blueprint_edit_updates_and_saves_a_new_blueprint(forged):
+    server, port, _ = forged
+    raw = _get_json(port, "/blueprint")["raw"]
+    raw["title"] = "手动改过的标题"
+    raw["topics"][0]["section_title"] = "一、手动改过的议题"
+
+    res = _post(port, "/blueprint/edit", {"blueprint": raw})
+    assert res["ok"], res
+
+    edited = res["blueprint"]
+    assert edited["title"] == "手动改过的标题"
+    assert edited["topics"][0]["section_title"] == "一、手动改过的议题"
+    assert _get_json(port, "/blueprint")["title"] == "手动改过的标题"
+    assert "手动改过的标题" in _get(port, "/blueprint.md")
+
+    # 旧蓝图文件不被覆盖，新蓝图另存一份
+    assert len(list(server.blueprint_dir.glob("*.json"))) >= 2
+
+
+def test_blueprint_edit_rejects_an_invalid_blueprint(forged):
+    server, port, bp = forged
+    raw = _get_json(port, "/blueprint")["raw"]
+    raw["personas"] = raw["personas"][:1]
+
+    res = _post(port, "/blueprint/edit", {"blueprint": raw})
+    assert res["ok"] is False
+    assert "2–5" in res["why"]
+    assert _get_json(port, "/blueprint")["title"] == bp["title"]
+
+
+def test_blueprint_edit_is_rejected_while_a_job_is_running(forged):
+    server, port, _ = forged
+    raw = _get_json(port, "/blueprint")["raw"]
+    server.job = _NeverFinishes()
+
+    res = _post(port, "/blueprint/edit", {"blueprint": raw})
+    assert res["ok"] is False
+    assert "已经有一轮" in res["why"]
