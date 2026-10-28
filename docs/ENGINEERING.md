@@ -263,6 +263,24 @@ AI 尽量点名落实，人数对不上时自行合并或补齐。逐位设置�
   返回前无法掐断，返回后若已被取消或取代就丢弃。成功后复用 `forge_done` 事件，
   页面不必再写一套蓝图渲染。
 
+### 手动编辑蓝图
+
+`/blueprint/edit` 接受网页上手动改过的完整蓝图 JSON（和 `blueprints/*.json` 同格式）：
+
+- 不走 `_Job`：不调用模型，是同步请求；但准入规则一样——有任务在跑时拒绝，
+  校验和赋值都在 `server._lock` 里。
+- 校验直接复用 `blueprint.from_dict`：2–5 位专家、称呼不重名、议题 key 唯一、
+  不能占用 `closing` / `convergence`、必填字段，全部和读蓝图文件同一套代码。
+  校验失败返回 `{ok: false, why}`，`server.blueprint` 不动。
+- 通过后 `save_bundle` 另存一份新蓝图（旧文件不覆盖），再替换 `server.blueprint`，
+  所以 `/blueprint`、下载、下一轮 `run` 立刻用新版本。
+- 响应里带完整的 `_blueprint_payload`（含 `raw`），网页直接 `renderBlueprint`，
+  不需要再拉一次 `/blueprint`。`/blueprint` 的 payload 也多了一个 `raw` 字段，
+  供编辑器预填。
+
+它和 `reforge` 是两条路：`reforge` 让模型重生成一版，`/blueprint/edit` 直接改
+这一版；两者可以配合使用。
+
 ---
 
 ## 四、为什么发言纪律由代码追加
@@ -555,7 +573,7 @@ tiktoken 会去 `openaipublic.blob.core.windows.net` **下载**——那个域�
 uv run pytest
 ```
 
-350 条，全部离线（用的是模拟后端，不花钱、不联网）。九个文件各管一层：
+353 条，全部离线（用的是模拟后端，不花钱、不联网）。九个文件各管一层：
 
 | 文件 | 管什么 |
 |---|---|
@@ -566,7 +584,7 @@ uv run pytest
 | `tests/test_society.py` | 2/3 人轮次与顺序、全员收手、单人反对继续、记录与拼装、最终统一轮、分歧标记 |
 | `tests/test_pipeline_run.py` | 端到端跑一遍：2/3 人落盘、钩子、收手开关、整理环节拿到人数、统一轮的触发/关闭/落盘 |
 | `tests/test_followup.py` | 追加/反复、提问插在标题下、免责声明保持最后、一次性的成果上下文、统一轮、停止/空整理不改文件、追问 → 议题截断 |
-| `tests/test_launcher.py` | 广播、HTTP 路由、两段式准入、人数/团队要求、材料提炼与「材料 + 目的」、重生成议题/人格与自定义要求、多人事件、统一事件、追加讨论事件与反复、keep-alive、停止不写文件 |
+| `tests/test_launcher.py` | 广播、HTTP 路由、两段式准入、人数/团队要求、材料提炼与「材料 + 目的」、重生成议题/人格与自定义要求、手动编辑蓝图、多人事件、统一事件、追加讨论事件与反复、keep-alive、停止不写文件 |
 | `tests/test_cli.py` | 五个子命令跑得通，`--people` / `--team-hint` / 人格数组，重生成议题/人格与 `--hint`，追加讨论的反复与标题，参数给错时报的是人话 |
 
 几条值得知道的：
@@ -636,7 +654,8 @@ daemon worker 线程：同步调用 authoring / pipeline
 - worker 是 daemon 且**永不 join**：关页面不该等模型把这一轮跑完。
 - **准入必须加锁**。`server._lock` 保护「检查是否有任务在跑 → 构造 job → 赋值」这
   三步；否则两个 `/forge`（或 `/forge` 撞 `/run` / `/reforge` / `/followup`）会同时
-  通过检查，起两个付费 worker。`job.start()` 在锁外调用。锁序单向：
+  通过检查，起两个付费 worker。`/blueprint/edit` 不建 job，但也用同一把锁检查
+  「有没有任务在跑」并替换蓝图。`job.start()` 在锁外调用。锁序单向：
   `server._lock` → `_Bus._lock`。
 - **终态事件先于 `finished.set()`**。反过来的话，新 job 的 `bus.reset()` 可能夹在
   中间，旧 job 的 `done` 会落进新 job 的历史里。
